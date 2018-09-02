@@ -1,20 +1,19 @@
 LOCAL_PATH := $(call my-dir)
 ifneq ($(filter cappu, $(TARGET_DEVICE)),)
-
 include $(CLEAR_VARS)
 LOCAL_MODULE := libaudiocustparam
-LOCAL_SRC_FILES_64 := proprietary/vendor/lib64/libaudiocustparam.so
-LOCAL_MULTILIB := 64
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
+LOCAL_MULTILIB := 64
+LOCAL_SRC_FILES_64 := proprietary/vendor/lib64/libaudiocustparam.so
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := libaudiocustparam
-LOCAL_SRC_FILES_32 := proprietary/vendor/lib/libaudiocustparam.so
-LOCAL_MULTILIB := 32
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
+LOCAL_MULTILIB := 32
+LOCAL_SRC_FILES_32 := proprietary/vendor/lib/libaudiocustparam.so
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
@@ -34,6 +33,38 @@ LOCAL_SRC_FILES_64 := proprietary/vendor/lib64/libdpframework.so
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
+LOCAL_MODULE = libged
+LOCAL_MODULE_CLASS = SHARED_LIBRARIES
+LOCAL_MODULE_SUFFIX = .so
+LOCAL_MULTILIB = 32
+LOCAL_SRC_FILES_32 = proprietary/vendor/lib/libged.so
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE = libged
+LOCAL_MODULE_CLASS = SHARED_LIBRARIES
+LOCAL_MODULE_SUFFIX = .so
+LOCAL_MULTILIB = 64
+LOCAL_SRC_FILES_64 = proprietary/vendor/lib64/libged.so
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE = libion_mtk
+LOCAL_MODULE_CLASS = SHARED_LIBRARIES
+LOCAL_MODULE_SUFFIX = .so
+LOCAL_MULTILIB = 32
+LOCAL_SRC_FILES_32 = proprietary/vendor/lib/libion_mtk.so
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE = libion_mtk
+LOCAL_MODULE_CLASS = SHARED_LIBRARIES
+LOCAL_MODULE_SUFFIX = .so
+LOCAL_MULTILIB = 64
+LOCAL_SRC_FILES_64 = proprietary/vendor/lib64/libion_mtk.so
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
 LOCAL_MODULE := libmtkcam_fwkutils
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
@@ -48,26 +79,4 @@ LOCAL_MODULE_SUFFIX := .so
 LOCAL_MULTILIB := 64
 LOCAL_SRC_FILES_64 := proprietary/vendor/lib64/libmtkcam_fwkutils.so
 include $(BUILD_PREBUILT)
-
-
-include $(CLEAR_VARS)
-LOCAL_MODULE = libstagefright_color_conversion
-LOCAL_MODULE_CLASS = STATIC_LIBRARIES
-LOCAL_MODULE_SUFFIX = .a
-LOCAL_UNINSTALLABLE_MODULE = true
-LOCAL_MULTILIB = 64
-LOCAL_SHARED_LIBRARIES_64 = libdpframework
-LOCAL_SRC_FILES_64 = libstagefright_color_conversion/libstagefright_color_conversion_64.a
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE = libstagefright_color_conversion
-LOCAL_MODULE_CLASS = STATIC_LIBRARIES
-LOCAL_MODULE_SUFFIX = .a
-LOCAL_UNINSTALLABLE_MODULE = true
-LOCAL_MULTILIB = 32
-LOCAL_SHARED_LIBRARIES_32 = libdpframework
-LOCAL_SRC_FILES_32 = libstagefright_color_conversion/libstagefright_color_conversion_32.a
-include $(BUILD_PREBUILT)
-
 endif
