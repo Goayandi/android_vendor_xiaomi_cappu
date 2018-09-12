@@ -49,25 +49,4 @@ LOCAL_MULTILIB := 64
 LOCAL_SRC_FILES_64 := proprietary/vendor/lib64/libmtkcam_fwkutils.so
 include $(BUILD_PREBUILT)
 
-
-include $(CLEAR_VARS)
-LOCAL_MODULE = libstagefright_color_conversion
-LOCAL_MODULE_CLASS = STATIC_LIBRARIES
-LOCAL_MODULE_SUFFIX = .a
-LOCAL_UNINSTALLABLE_MODULE = true
-LOCAL_MULTILIB = 64
-LOCAL_SHARED_LIBRARIES_64 = libdpframework
-LOCAL_SRC_FILES_64 = libstagefright_color_conversion/libstagefright_color_conversion_64.a
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE = libstagefright_color_conversion
-LOCAL_MODULE_CLASS = STATIC_LIBRARIES
-LOCAL_MODULE_SUFFIX = .a
-LOCAL_UNINSTALLABLE_MODULE = true
-LOCAL_MULTILIB = 32
-LOCAL_SHARED_LIBRARIES_32 = libdpframework
-LOCAL_SRC_FILES_32 = libstagefright_color_conversion/libstagefright_color_conversion_32.a
-include $(BUILD_PREBUILT)
-
 endif
