@@ -1,0 +1,3167 @@
+=%ld\n",
+		       c->name, (unsigned long)c->base.phys,
+		       (unsigned long)c->base.len);
+
+	c->base.virt = ioremap_nocache(c->base.phys, c->base.len);
+	if (!c->base.virt) {
+		printk(KERN_ERR "%s: Unable to map controller.\n", c->name);
+		i2o_pci_free(c);
+		return -ENOMEM;
+	}
+
+	if (c->raptor) {
+		c->in_queue.virt =
+		    ioremap_nocache(c->in_queue.phys, c->in_queue.len);
+		if (!c->in_queue.virt) {
+			printk(KERN_ERR "%s: Unable to map controller.\n",
+			       c->name);
+			i2o_pci_free(c);
+			return -ENOMEM;
+		}
+	} else
+		c->in_queue = c->base;
+
+	c->irq_status = c->base.virt + I2O_IRQ_STATUS;
+	c->irq_mask = c->base.virt + I2O_IRQ_MASK;
+	c->in_port = c->base.virt + I2O_IN_PORT;
+	c->out_port = c->base.virt + I2O_OUT_PORT;
+
+	/* Motorola/Freescale chip does not follow spec */
+	if (pdev->vendor == PCI_VENDOR_ID_MOTOROLA && pdev->device == 0x18c0) {
+		/* Check if CPU is enabled */
+		if (be32_to_cpu(readl(c->base.virt + 0x10000)) & 0x10000000) {
+			printk(KERN_INFO "%s: MPC82XX needs CPU running to "
+			       "service I2O.\n", c->name);
+			i2o_pci_free(c);
+			return -ENODEV;
+		} else {
+			c->irq_status += I2O_MOTOROLA_PORT_OFFSET;
+			c->irq_mask += I2O_MOTOROLA_PORT_OFFSET;
+			c->in_port += I2O_MOTOROLA_PORT_OFFSET;
+			c->out_port += I2O_MOTOROLA_PORT_OFFSET;
+			printk(KERN_INFO "%s: MPC82XX workarounds activated.\n",
+			       c->name);
+		}
+	}
+
+	if (i2o_dma_alloc(dev, &c->status, 8)) {
+		i2o_pci_free(c);
+		return -ENOMEM;
+	}
+
+	if (i2o_dma_alloc(dev, &c->hrt, sizeof(i2o_hrt))) {
+		i2o_pci_free(c);
+		return -ENOMEM;
+	}
+
+	if (i2o_dma_alloc(dev, &c->dlct, 8192)) {
+		i2o_pci_free(c);
+		return -ENOMEM;
+	}
+
+	if (i2o_dma_alloc(dev, &c->status_block, sizeof(i2o_status_block))) {
+		i2o_pci_free(c);
+		return -ENOMEM;
+	}
+
+	if (i2o_dma_alloc(dev, &c->out_queue,
+		I2O_MAX_OUTBOUND_MSG_FRAMES * I2O_OUTBOUND_MSG_FRAME_SIZE *
+				sizeof(u32))) {
+		i2o_pci_free(c);
+		return -ENOMEM;
+	}
+
+	pci_set_drvdata(pdev, c);
+
+	return 0;
+}
+
+/**
+ *	i2o_pci_interrupt - Interrupt handler for I2O controller
+ *	@irq: interrupt line
+ *	@dev_id: pointer to the I2O controller
+ *
+ *	Handle an interrupt from a PCI based I2O controller. This turns out
+ *	to be rather simple. We keep the controller pointer in the cookie.
+ */
+static irqreturn_t i2o_pci_interrupt(int irq, void *dev_id)
+{
+	struct i2o_controller *c = dev_id;
+	u32 m;
+	irqreturn_t rc = IRQ_NONE;
+
+	while (readl(c->irq_status) & I2O_IRQ_OUTBOUND_POST) {
+		m = readl(c->out_port);
+		if (m == I2O_QUEUE_EMPTY) {
+			/*
+			 * Old 960 steppings had a bug in the I2O unit that
+			 * caused the queue to appear empty when it wasn't.
+			 */
+			m = readl(c->out_port);
+			if (unlikely(m == I2O_QUEUE_EMPTY))
+				break;
+		}
+
+		/* dispatch it */
+		if (i2o_driver_dispatch(c, m))
+			/* flush it if result != 0 */
+			i2o_flush_reply(c, m);
+
+		rc = IRQ_HANDLED;
+	}
+
+	return rc;
+}
+
+/**
+ *	i2o_pci_irq_enable - Allocate interrupt for I2O controller
+ *	@c: i2o_controller that the request is for
+ *
+ *	Allocate an interrupt for the I2O controller, and activate interrupts
+ *	on the I2O controller.
+ *
+ *	Returns 0 on success or negative error code on failure.
+ */
+static int i2o_pci_irq_enable(struct i2o_controller *c)
+{
+	struct pci_dev *pdev = c->pdev;
+	int rc;
+
+	writel(0xffffffff, c->irq_mask);
+
+	if (pdev->irq) {
+		rc = request_irq(pdev->irq, i2o_pci_interrupt, IRQF_SHARED,
+				 c->name, c);
+		if (rc < 0) {
+			printk(KERN_ERR "%s: unable to allocate interrupt %d."
+			       "\n", c->name, pdev->irq);
+			return rc;
+		}
+	}
+
+	writel(0x00000000, c->irq_mask);
+
+	printk(KERN_INFO "%s: Installed at IRQ %d\n", c->name, pdev->irq);
+
+	return 0;
+}
+
+/**
+ *	i2o_pci_irq_disable - Free interrupt for I2O controller
+ *	@c: I2O controller
+ *
+ *	Disable interrupts in I2O controller and then free interrupt.
+ */
+static void i2o_pci_irq_disable(struct i2o_controller *c)
+{
+	writel(0xffffffff, c->irq_mask);
+
+	if (c->pdev->irq > 0)
+		free_irq(c->pdev->irq, c);
+}
+
+/**
+ *	i2o_pci_probe - Probe the PCI device for an I2O controller
+ *	@pdev: PCI device to test
+ *	@id: id which matched with the PCI device id table
+ *
+ *	Probe the PCI device for any device which is a memory of the
+ *	Intelligent, I2O class or an Adaptec Zero Channel Controller. We
+ *	attempt to set up each such device and register it with the core.
+ *
+ *	Returns 0 on success or negative error code on failure.
+ */
+static int i2o_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	struct i2o_controller *c;
+	int rc;
+	struct pci_dev *i960 = NULL;
+
+	printk(KERN_INFO "i2o: Checking for PCI I2O controllers...\n");
+
+	if ((pdev->class & 0xff) > 1) {
+		printk(KERN_WARNING "i2o: %s does not support I2O 1.5 "
+		       "(skipping).\n", pci_name(pdev));
+		return -ENODEV;
+	}
+
+	if ((rc = pci_enable_device(pdev))) {
+		printk(KERN_WARNING "i2o: couldn't enable device %s\n",
+		       pci_name(pdev));
+		return rc;
+	}
+
+	if (pci_set_dma_mask(pdev, DMA_BIT_MASK(32))) {
+		printk(KERN_WARNING "i2o: no suitable DMA found for %s\n",
+		       pci_name(pdev));
+		rc = -ENODEV;
+		goto disable;
+	}
+
+	pci_set_master(pdev);
+
+	c = i2o_iop_alloc();
+	if (IS_ERR(c)) {
+		printk(KERN_ERR "i2o: couldn't allocate memory for %s\n",
+		       pci_name(pdev));
+		rc = PTR_ERR(c);
+		goto disable;
+	} else
+		printk(KERN_INFO "%s: controller found (%s)\n", c->name,
+		       pci_name(pdev));
+
+	c->pdev = pdev;
+	c->device.parent = &pdev->dev;
+
+	/* Cards that fall apart if you hit them with large I/O loads... */
+	if (pdev->vendor == PCI_VENDOR_ID_NCR && pdev->device == 0x0630) {
+		c->short_req = 1;
+		printk(KERN_INFO "%s: Symbios FC920 workarounds activated.\n",
+		       c->name);
+	}
+
+	if (pdev->subsystem_vendor == PCI_VENDOR_ID_PROMISE) {
+		/*
+		 * Expose the ship behind i960 for initialization, or it will
+		 * failed
+		 */
+		i960 = pci_get_slot(c->pdev->bus,
+				  PCI_DEVFN(PCI_SLOT(c->pdev->devfn), 0));
+
+		if (i960) {
+			pci_write_config_word(i960, 0x42, 0);
+			pci_dev_put(i960);
+		}
+
+		c->promise = 1;
+		c->limit_sectors = 1;
+	}
+
+	if (pdev->subsystem_vendor == PCI_VENDOR_ID_DPT)
+		c->adaptec = 1;
+
+	/* Cards that go bananas if you quiesce them before you reset them. */
+	if (pdev->vendor == PCI_VENDOR_ID_DPT) {
+		c->no_quiesce = 1;
+		if (pdev->device == 0xa511)
+			c->raptor = 1;
+
+		if (pdev->subsystem_device == 0xc05a) {
+			c->limit_sectors = 1;
+			printk(KERN_INFO
+			       "%s: limit sectors per request to %d\n", c->name,
+			       I2O_MAX_SECTORS_LIMITED);
+		}
+#ifdef CONFIG_I2O_EXT_ADAPTEC_DMA64
+		if (sizeof(dma_addr_t) > 4) {
+			if (pci_set_dma_mask(pdev, DMA_BIT_MASK(64)))
+				printk(KERN_INFO "%s: 64-bit DMA unavailable\n",
+				       c->name);
+			else {
+				c->pae_support = 1;
+				printk(KERN_INFO "%s: using 64-bit DMA\n",
+				       c->name);
+			}
+		}
+#endif
+	}
+
+	if ((rc = i2o_pci_alloc(c))) {
+		printk(KERN_ERR "%s: DMA / IO allocation for I2O controller "
+		       "failed\n", c->name);
+		goto free_controller;
+	}
+
+	if (i2o_pci_irq_enable(c)) {
+		printk(KERN_ERR "%s: unable to enable interrupts for I2O "
+		       "controller\n", c->name);
+		goto free_pci;
+	}
+
+	if ((rc = i2o_iop_add(c)))
+		goto uninstall;
+
+	if (i960)
+		pci_write_config_word(i960, 0x42, 0x03ff);
+
+	return 0;
+
+      uninstall:
+	i2o_pci_irq_disable(c);
+
+      free_pci:
+	i2o_pci_free(c);
+
+      free_controller:
+	i2o_iop_free(c);
+
+      disable:
+	pci_disable_device(pdev);
+
+	return rc;
+}
+
+/**
+ *	i2o_pci_remove - Removes a I2O controller from the system
+ *	@pdev: I2O controller which should be removed
+ *
+ *	Reset the I2O controller, disable interrupts and remove all allocated
+ *	resources.
+ */
+static void i2o_pci_remove(struct pci_dev *pdev)
+{
+	struct i2o_controller *c;
+	c = pci_get_drvdata(pdev);
+
+	i2o_iop_remove(c);
+	i2o_pci_irq_disable(c);
+	i2o_pci_free(c);
+
+	pci_disable_device(pdev);
+
+	printk(KERN_INFO "%s: Controller removed.\n", c->name);
+
+	put_device(&c->device);
+};
+
+/* PCI driver for I2O controller */
+static struct pci_driver i2o_pci_driver = {
+	.name = "PCI_I2O",
+	.id_table = i2o_pci_ids,
+	.probe = i2o_pci_probe,
+	.remove = i2o_pci_remove,
+};
+
+/**
+ *	i2o_pci_init - registers I2O PCI driver in PCI subsystem
+ *
+ *	Returns > 0 on success or negative error code on failure.
+ */
+int __init i2o_pci_init(void)
+{
+	return pci_register_driver(&i2o_pci_driver);
+};
+
+/**
+ *	i2o_pci_exit - unregisters I2O PCI driver from PCI subsystem
+ */
+void __exit i2o_pci_exit(void)
+{
+	pci_unregister_driver(&i2o_pci_driver);
+};
+
+MODULE_DEVICE_TABLE(pci, i2o_pci_ids);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+* Copyright (C) 2016 MediaTek Inc.
+*
+* This program is free software: you can redistribute it and/or modify it under the terms of the
+* GNU General Public License version 2 as published by the Free Software Foundation.
+*
+* This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+* without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+* See the GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License along with this program.
+* If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/*
+** Id: //Department/DaVinci/BRANCHES/HS2_DEV_SW/MT6620_WIFI_DRIVER_V2_1_HS_2_0/mgmt/hs20.c#2
+*/
+
+/*! \file   "hs20.c"
+    \brief  This file including the hotspot 2.0 related function.
+
+    This file provided the macros and functions library support for the
+    protocol layer hotspot 2.0 related function.
+
+*/
+
+ /*******************************************************************************
+*                         C O M P I L E R   F L A G S
+********************************************************************************
+*/
+
+/*******************************************************************************
+*                    E X T E R N A L   R E F E R E N C E S
+********************************************************************************
+*/
+#include "precomp.h"
+
+#if CFG_SUPPORT_PASSPOINT
+
+/*******************************************************************************
+*                              C O N S T A N T S
+********************************************************************************
+*/
+
+/*******************************************************************************
+*                             D A T A   T Y P E S
+********************************************************************************
+*/
+
+/*******************************************************************************
+*                            P U B L I C   D A T A
+********************************************************************************
+*/
+
+/*******************************************************************************
+*                           P R I V A T E   D A T A
+********************************************************************************
+*/
+
+/*******************************************************************************
+*                                 M A C R O S
+********************************************************************************
+*/
+
+/*******************************************************************************
+*                   F U N C T I O N   D E C L A R A T I O N S
+********************************************************************************
+*/
+
+/*******************************************************************************
+*                              F U N C T I O N S
+********************************************************************************
+*/
+
+/*----------------------------------------------------------------------------*/
+/*!
+* \brief    This function is called to generate Interworking IE for Probe Rsp, Bcn, Assoc Req/Rsp.
+*
+* \param[in] prAdapter  Pointer of ADAPTER_T
+* \param[out] prMsduInfo  Pointer of the Msdu Info
+*
+* \return VOID
+*/
+/*----------------------------------------------------------------------------*/
+VOID hs20GenerateInterworkingIE(IN P_ADAPTER_T prAdapter, OUT P_MSDU_INFO_T prMsduInfo)
+{
+}
+
+/*----------------------------------------------------------------------------*/
+/*!
+* \brief    This function is called to generate Roaming Consortium IE for Probe Rsp, Bcn, Assoc Req/Rsp.
+*
+* \param[in] prAdapter  Pointer of ADAPTER_T
+* \param[out] prMsduInfo  Pointer of the Msdu Info
+*
+* \return VOID
+*/
+/*----------------------------------------------------------------------------*/
+VOID hs20GenerateRoamingConsortiumIE(IN P_ADAPTER_T prAdapter, OUT P_MSDU_INFO_T prMsduInfo)
+{
+}
+
+/*----------------------------------------------------------------------------*/
+/*!
+* \brief    This function is called to generate HS2.0 IE for Probe Rsp, Bcn, Assoc Req/Rsp.
+*
+* \param[in] prAdapter  Pointer of ADAPTER_T
+* \param[out] prMsduInfo  Pointer of the Msdu Info
+*
+* \return VOID
+*/
+/*----------------------------------------------------------------------------*/
+VOID hs20GenerateHS20IE(IN P_ADAPTER_T prAdapter, OUT P_MSDU_INFO_T prMsduInfo)
+{
+	PUINT_8 pucBuffer;
+
+	ASSERT(prAdapter);
+	ASSERT(prMsduInfo);
+
+	if (prMsduInfo->ucBssIndex != KAL_NETWORK_TYPE_AIS_INDEX) {
+		DBGLOG(HS20, INFO, "[%s] prMsduInfo->ucBssIndex(%d) is not KAL_NETWORK_TYPE_AIS_INDEX\n",
+			__func__, prMsduInfo->ucBssIndex);
+		return;
+	}
+
+	pucBuffer = (PUINT_8) ((ULONG) prMsduInfo->prPacket + (ULONG) prMsduInfo->u2FrameLength);
+
+	/* ASSOC INFO IE ID: 221 :0xDD */
+	if (prAdapter->prGlueInfo->u2HS20AssocInfoIELen) {
+		kalMemCopy(pucBuffer, &prAdapter->prGlueInfo->aucHS20AssocInfoIE,
+			   prAdapter->prGlueInfo->u2HS20AssocInfoIELen);
+		prMsduInfo->u2FrameLength += prAdapter->prGlueInfo->u2HS20AssocInfoIELen;
+	}
+
+}
+
+VOID hs20FillExtCapIE(P_ADAPTER_T prAdapter, P_BSS_INFO_T prBssInfo, P_MSDU_INFO_T prMsduInfo)
+{
+	P_EXT_CAP_T prExtCap;
+
+	ASSERT(prAdapter);
+	ASSERT(prMsduInfo);
+
+	/* Add Extended Capabilities IE */
+	prExtCap = (P_EXT_CAP_T)
+	    (((PUINT_8) prMsduInfo->prPacket) + prMsduInfo->u2FrameLength);
+
+	prExtCap->ucId = ELEM_ID_EXTENDED_CAP;
+	if (prAdapter->prGlueInfo->fgConnectHS20AP == TRUE)
+		prExtCap->ucLength = ELEM_MAX_LEN_EXT_CAP;
+	else
+		prExtCap->ucLength = 3 - ELEM_HDR_LEN;
+
+	kalMemZero(prExtCap->aucCapabilities, prExtCap->ucLength);
+
+	prExtCap->aucCapabilities[0] = ELEM_EXT_CAP_DEFAULT_VAL;
+
+	if (prBssInfo->eCurrentOPMode != OP_MODE_INFRASTRUCTURE)
+		prExtCap->aucCapabilities[0] &= ~ELEM_EXT_CAP_PSMP_CAP;
+
+	if (prAdapter->prGlueInfo->fgConnectHS20AP == TRUE) {
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_BSS_TRANSITION_BIT);
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_UTC_TSF_OFFSET_BIT);
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_INTERWORKING_BIT);
+
+		/* For R2 WNM-Notification */
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_WNM_NOTIFICATION_BIT);
+	}
+
+	DBGLOG(HS20, INFO, "IE_SIZE(prExtCap) = %d, %d %d\n", IE_SIZE(prExtCap),
+		ELEM_HDR_LEN, ELEM_MAX_LEN_EXT_CAP);
+	ASSERT(IE_SIZE(prExtCap) <= (ELEM_HDR_LEN + ELEM_MAX_LEN_EXT_CAP));
+
+	prMsduInfo->u2FrameLength += IE_SIZE(prExtCap);
+}
+
+/*----------------------------------------------------------------------------*/
+/*!
+* \brief    This function is called to fill up the content of Ext Cap IE bit 31.
+*
+* \param[in] prAdapter  Pointer of ADAPTER_T
+* \param[out] pucIE  Pointer of the IE buffer
+*
+* \return VOID
+*/
+/*----------------------------------------------------------------------------*/
+VOID hs20FillProreqExtCapIE(IN P_ADAPTER_T prAdapter, OUT PUINT_8 pucIE)
+{
+	P_EXT_CAP_T prExtCap;
+
+	ASSERT(prAdapter);
+
+	/* Add Extended Capabilities IE */
+	prExtCap = (P_EXT_CAP_T) pucIE;
+
+	prExtCap->ucId = ELEM_ID_EXTENDED_CAP;
+	if (prAdapter->prGlueInfo->fgConnectHS20AP == TRUE)
+		prExtCap->ucLength = ELEM_MAX_LEN_EXT_CAP;
+	else
+		prExtCap->ucLength = 3 - ELEM_HDR_LEN;
+
+	kalMemZero(prExtCap->aucCapabilities, prExtCap->ucLength);
+
+	prExtCap->aucCapabilities[0] = ELEM_EXT_CAP_DEFAULT_VAL;
+
+	if (prAdapter->prGlueInfo->fgConnectHS20AP == TRUE) {
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_BSS_TRANSITION_BIT);
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_UTC_TSF_OFFSET_BIT);
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_INTERWORKING_BIT);
+
+		/* For R2 WNM-Notification */
+		SET_EXT_CAP(prExtCap->aucCapabilities, ELEM_MAX_LEN_EXT_CAP, ELEM_EXT_CAP_WNM_NOTIFICATION_BIT);
+	}
+}
+
+/*----------------------------------------------------------------------------*/
+/*!
+* \brief    This function is called to fill up the content of HS2.0 IE.
+*
+* \param[in] prAdapter  Pointer of ADAPTER_T
+* \param[out] pucIE  Pointer of the IE buffer
+*
+* \return VOID
+*/
+/*----------------------------------------------------------------------------*/
+VOID hs20FillHS20IE(IN P_ADAPTER_T prAdapter, OUT PUINT_8 pucIE)
+{
+	P_IE_HS20_INDICATION_T prHS20IndicationIe;
+	/* P_HS20_INFO_T prHS20Info; */
+	UINT_8 aucWfaOui[] = VENDOR_OUI_WFA_SPECIFIC;
+
+	/* prHS20Info = &(prAdapter->rWifiVar.rHS20Info); */
+
+	prHS20IndicationIe = (P_IE_HS20_INDICATION_T) pucIE;
+
+	prHS20IndicationIe->ucId = ELEM_ID_VENDOR;
+	prHS20IndicationIe->ucLength = sizeof(IE_HS20_INDICATION_T) - ELEM_HDR_LEN;
+	prHS20IndicationIe->aucOui[0] = aucWfaOui[0];
+	prHS20IndicationIe->aucOui[1] = aucWfaOui[1];
+	prHS20IndicationIe->aucOui[2] = aucWfaOui[2];
+	prHS20IndicationIe->ucType = VENDOR_OUI_TYPE_HS20;
+
+	/* prHS20IndicationIe->ucHotspotConfig = 0x00; *//* For PASSPOINT_R1 */
+	prHS20IndicationIe->ucHotspotConfig = 0x10;	/* For PASSPOINT_R2 */
+
+}
+
+/*----------------------------------------------------------------------------*/
+/*!
+* \brief    This function is called while calculating length of hotspot 2.0 indication IE for Probe Request.
+*
+* \param[in] prAdapter  Pointer of ADAPTER_T
+* \param[in] pucTargetBSSID  Pointer of target HESSID
+*
+* \return the length of composed HS20 IE
+*/
+/*----------------------------------------------------------------------------*/
+UINT_32 hs20CalculateHS20RelatedIEForProbeReq(IN P_ADAPTER_T prAdapter, IN PUINT_8 pucTargetBSSID)
+{
+	UINT_32 u4IeLength;
+
+	if (0)			/* Todo:: Not HS20 STA */
+		return 0;
+
+	u4IeLength = sizeof(IE_HS20_INDICATION_T) + /* sizeof(IE_INTERWORKING_T) */ + (ELEM_HDR_LEN +
+										      ELEM_MAX_LEN_EXT_CAP);
+
+	if (!pucTargetBSSID) {
+		/* Todo:: Nothing */
+		/* u4IeLength -= MAC_ADDR_LEN; */
+	}
+
+	return u4IeLength;
+}
+
+/*----------------------------------------------------------------------------*/
+/*!
+* \brief    This function is called while composing hotspot 2.0 indication IE for Probe Request.
+*
+* \param[in] prAdapter  Pointer of ADAPTER_T
+* \param[in] pucTargetBSSID  Pointer of target HESSID
+* \param[out] prIE  Pointer of the IE buffer
+*
+* \return the wlan status
+*/
+/*----------------------------------------------------------------------------*/
+WLAN_STATUS hs20GenerateHS20RelatedIEForProbeReq(IN P_ADAPTER_T prAdapter, IN PUINT_8 pucTargetBSSID, OUT PUINT_8 prIE)
+{
+	if (0)			/* Todo:: Not HS20 STA */
+		return 0;
+#if 0
+	P_HS20_INFO_T prHS20Info;
+
+	prHS20Info = &(prAdapter->rWifiVar.rHS20Info);
+
+	/*
+	 * Generate 802.11u Interworking IE (107)
+	 */
+	hs20FillInterworkingIE(prAdapter,
+			       prHS20Info->ucAccessNetworkOptions,
+			       prHS20Info->ucVenueGroup, prHS20Info->ucVenueType, pucTargetBSSID, prIE);
+	prIE += IE_SIZE(prIE);
+#endif
+	/*
+	 * Generate Ext Cap IE (127)
+	 */
+	hs20FillProreqExtCapIE(prAdapter, prIE);
+	prIE += IE_SIZE(prIE);
+
+	/*
+	 * Generate HS2.0 Indication IE (221)
+	 */
+	hs20FillHS20IE(prAdapter, prIE);
+	prIE += IE_SIZE(prIE);
+
+	return WLAN_STATUS_SUCCESS;
+}
+
+BOOLEAN hs20IsGratuitousArp(IN P_ADAPTER_T prAdapter, IN P_SW_RFB_T prCurrSwRfb)
+{
+	PUINT_8 pucSenderIP = prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + ARP_SENDER_IP_OFFSET;
+	PUINT_8 pucTargetIP = prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + ARP_TARGET_IP_OFFSET;
+	PUINT_8 pucSenderMac = ((PUINT_8) prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + ARP_SNEDER_MAC_OFFSET);
+#if CFG_HS20_DEBUG && 0
+/* UINT_8  aucIpAllZero[4] = {0,0,0,0}; */
+/* UINT_8  aucMACAllZero[MAC_ADDR_LEN] = {0,0,0,0,0,0}; */
+	PUINT_8 pucTargetMac = ((PUINT_8) prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + ARP_TARGET_MAC_OFFSET);
+#endif
+
+#if CFG_HS20_DEBUG && 0
+	PUINT_16 pu2ArpOper = (PUINT_16) ((PUINT_8) prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + ARP_OPERATION_OFFSET);
+
+	kalPrint("Recv ARP 0x%04X\n", htons(*pu2ArpOper));
+	kalPrint("SENDER[" MACSTR "] [%d:%d:%d:%d]\n", MAC2STR(pucSenderMac), *pucSenderIP,
+		*(pucSenderIP + 1), *(pucSenderIP + 2), *(pucSenderIP + 3));
+	kalPrint("TARGET[" MACSTR "] [%d:%d:%d:%d]\n", MAC2STR(pucTargetMac), *pucTargetIP,
+		*(pucTargetIP + 1), *(pucTargetIP + 2), *(pucTargetIP + 3));
+#endif
+
+	/* IsGratuitousArp */
+	if (!kalMemCmp(pucSenderIP, pucTargetIP, 4)) {
+		kalPrint("Drop Gratuitous ARP from [" MACSTR "] [%d:%d:%d:%d]\n",
+			MAC2STR(pucSenderMac), *pucTargetIP, *(pucTargetIP + 1),
+			*(pucTargetIP + 2), *(pucTargetIP + 3));
+		return TRUE;
+	}
+	return FALSE;
+}
+
+BOOLEAN hs20IsUnsolicitedNeighborAdv(IN P_ADAPTER_T prAdapter, IN P_SW_RFB_T prCurrSwRfb)
+{
+	PUINT_8 pucIpv6Protocol = ((PUINT_8) prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + IPV6_HDR_IP_PROTOCOL_OFFSET);
+
+	/* kalPrint("pucIpv6Protocol [%02X:%02X]\n", *pucIpv6Protocol, IPV6_PROTOCOL_ICMPV6); */
+	if (*pucIpv6Protocol == IPV6_PROTOCOL_ICMPV6) {
+		PUINT_8 pucICMPv6Type =
+		    ((PUINT_8) prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + IPV6_HDR_LEN + ICMPV6_TYPE_OFFSET);
+		/* kalPrint("pucICMPv6Type [%02X:%02X]\n", *pucICMPv6Type, ICMPV6_TYPE_NEIGHBOR_ADVERTISEMENT); */
+		if (*pucICMPv6Type == ICMPV6_TYPE_NEIGHBOR_ADVERTISEMENT) {
+			PUINT_8 pucICMPv6Flag =
+			    ((PUINT_8) prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + IPV6_HDR_LEN + ICMPV6_FLAG_OFFSET);
+			PUINT_8 pucSrcMAC = ((PUINT_8) prCurrSwRfb->pvHeader + MAC_ADDR_LEN);
+
+#if CFG_HS20_DEBUG
+			kalPrint("NAdv Flag [%02X] [R(%d)\\S(%d)\\O(%d)]\n",
+				 *pucICMPv6Flag,
+				 (UINT_8) (*pucICMPv6Flag & ICMPV6_FLAG_ROUTER_BIT) >> 7,
+				 (UINT_8) (*pucICMPv6Flag & ICMPV6_FLAG_SOLICITED_BIT) >> 6,
+				 (UINT_8) (*pucICMPv6Flag & ICMPV6_FLAG_OVERWRITE_BIT) >> 5);
+#endif
+			if (!(*pucICMPv6Flag & ICMPV6_FLAG_SOLICITED_BIT)) {
+				kalPrint("Drop Unsolicited Neighbor Advertisement from [" MACSTR
+					 "]\n", MAC2STR(pucSrcMAC));
+				return TRUE;
+			}
+		}
+	}
+
+	return FALSE;
+}
+
+#if CFG_ENABLE_GTK_FRAME_FILTER
+BOOLEAN hs20IsForgedGTKFrame(IN P_ADAPTER_T prAdapter, IN P_BSS_INFO_T prBssInfo, IN P_SW_RFB_T prCurrSwRfb)
+{
+	/* 3 TODO: Need to verify this function before enable it */
+	return FALSE;
+#if 0
+	P_CONNECTION_SETTINGS_T prConnSettings = &prAdapter->rWifiVar.rConnSettings;
+		PUINT_8 pucEthDestAddr = prCurrSwRfb->pvHeader;
+
+	if ((prConnSettings->eEncStatus != ENUM_ENCRYPTION_DISABLED)
+	    && IS_BMCAST_MAC_ADDR(pucEthDestAddr)) {
+		UINT_8 ucIdx = 0;
+		PUINT_32 prIpAddr, prPacketDA;
+		PUINT_16 pu2PktIpVer =
+		    (PUINT_16) ((PUINT_8) prCurrSwRfb->pvHeader + (ETHER_HEADER_LEN - ETHER_TYPE_LEN));
+
+		if (*pu2PktIpVer == htons(ETH_P_IPV4)) {
+			if (!prBssInfo->prIpV4NetAddrList)
+				return FALSE;
+			for (ucIdx = 0; ucIdx < prBssInfo->prIpV4NetAddrList->ucAddrCount; ucIdx++) {
+				prIpAddr = (PUINT_32) &prBssInfo->prIpV4NetAddrList->arNetAddr[ucIdx].aucIpAddr[0];
+				prPacketDA =
+				    (PUINT_32) ((PUINT_8) prCurrSwRfb->pvHeader + ETHER_HEADER_LEN +
+						IPV4_HDR_IP_DST_ADDR_OFFSET);
+
+				if (kalMemCmp(prIpAddr, prPacketDA, 4) == 0) {
+					kalPrint("Drop FORGED IPv4 packet\n");
+					return TRUE;
+				}
+			}
+		}
+#ifdef CONFIG_IPV6
+		else if (*pu2PktIpVer == htons(ETH_P_IPV6)) {
+			UINT_8 aucIPv6Mac[MAC_ADDR_LEN];
+			PUINT_8 pucIdx =
+			    prCurrSwRfb->pvHeader + ETHER_HEADER_LEN + IPV6_HDR_IP_DST_ADDR_MAC_HIGH_OFFSET;
+
+			kalMemCopy(&aucIPv6Mac[0], pucIdx, 3);
+			pucIdx += 5;
+			kalMemCopy(&aucIPv6Mac[3], pucIdx, 3);
+			kalPrint("Get IPv6 frame Dst IP MAC part " MACSTR "\n", MAC2STR(aucIPv6Mac));
+			if (EQUAL_MAC_ADDR(aucIPv6Mac, prBssInfo->aucOwnMacAddr)) {
+				kalPrint("Drop FORGED IPv6 packet\n");
+				return TRUE;
+			}
+		}
+#endif
+	}
+
+	return FALSE;
+#endif
+}
+#endif
+
+BOOLEAN hs20IsUnsecuredFrame(IN P_ADAPTER_T prAdapter, IN P_BSS_INFO_T prBssInfo, IN P_SW_RFB_T prCurrSwRfb)
+{
+	PUINT_16 pu2PktIpVer = (PUINT_16) ((PUINT_8) prCurrSwRfb->pvHeader + (ETHER_HEADER_LEN - ETHER_TYPE_LEN));
+
+	/* kalPrint("IPVER 0x%4X\n", htons(*pu2PktIpVer)); */
+#if CFG_HS20_DEBUG & 0
+	UINT_8 i = 0;
+
+	kalPrint("===============================================");
+	for (i = 0; i < 96; i++) {
+		if (!(i % 16))
+			kalPrint("\n");
+		kalPrint("%02X ", *((PUINT_8) prCurrSwRfb->pvHeader + i));
+	}
+	kalPrint("\n");
+#endif
+
+#if CFG_ENABLE_GTK_FRAME_FILTER
+	if (hs20IsForgedGTKFrame(prAdapter, prBssInfo, prCurrSwRfb))
+		return TRUE;
+	 /* } else the else is very strange and not make sense here, mark for coding style check*/
+#endif
+	if (*pu2PktIpVer == htons(ETH_P_ARP))
+		return hs20IsGratuitousArp(prAdapter, prCurrSwRfb);
+	else if (*pu2PktIpVer == htons(ETH_P_IPV6))
+		return hs20IsUnsolicitedNeighborAdv(prAdapter, prCurrSwRfb);
+
+	return FALSE;
+}
+
+BOOLEAN hs20IsFrameFilterEnabled(IN P_ADAPTER_T prAdapter, IN P_BSS_INFO_T prBssInfo)
+{
+#if 1
+	if (prAdapter->prGlueInfo->fgConnectHS20AP)
+		return TRUE;
+#else
+	PARAM_SSID_T rParamSsid;
+	P_BSS_DESC_T prBssDesc;
+
+	rParamSsid.u4SsidLen = prBssInfo->ucSSIDLen;
+	COPY_SSID(rParamSsid.aucSsid, rParamSsid.u4SsidLen, prBssInfo->aucSSID, prBssInfo->ucSSIDLen);
+
+	prBssDesc = scanSearchBssDescByBssidAndSsid(prAdapter, prBssInfo->aucBSSID, TRUE, &rParamSsid);
+	if (!prBssDesc)
+		return FALSE;
+
+	if (prBssDesc->fgIsSupportHS20) {
+		if (!(prBssDesc->ucHotspotConfig & ELEM_HS_CONFIG_DGAF_DISABLED_MASK))
+			return TRUE;
+			/* Disable frame filter only if DGAF == 1 */
+			return FALSE;
+		}
+#endif
+
+	/* For Now, always return true to run hs20 check even for legacy AP */
+	return TRUE;
+}
+
+WLAN_STATUS hs20SetBssidPool(IN P_ADAPTER_T prAdapter, IN PVOID pvBuffer, IN ENUM_KAL_NETWORK_TYPE_INDEX_T eNetTypeIdx)
+{
+	P_PARAM_HS20_SET_BSSID_POOL prParamBssidPool = (P_PARAM_HS20_SET_BSSID_POOL) pvBuffer;
+	P_HS20_INFO_T prHS20Info;
+	UINT_8 ucIdx;
+
+	prHS20Info = &(prAdapter->rWifiVar.rHS20Info);
+
+	DBGLOG(HS20, INFO, "[%s]Set Bssid Pool! enable[%d] num[%d]\n", __func__, prParamBssidPool->fgIsEnable,
+		prParamBssidPool->ucNumBssidPool);
+
+	for (ucIdx = 0; ucIdx < prParamBssidPool->ucNumBssidPool; ucIdx++) {
+		COPY_MAC_ADDR(prHS20Info->arBssidPool[ucIdx].aucBSSID, &prParamBssidPool->arBSSID[ucIdx]);
+		DBGLOG(HS20, INFO, "[%s][%d][" MACSTR "]\n", __func__, ucIdx,
+			MAC2STR(prHS20Info->arBssidPool[ucIdx].aucBSSID));
+	}
+	prHS20Info->fgIsHS2SigmaMode = prParamBssidPool->fgIsEnable;
+	prHS20Info->ucNumBssidPoolEntry = prParamBssidPool->ucNumBssidPool;
+
+#if 0
+	wlanClearScanningResult(prAdapter);
+#endif
+
+	return WLAN_STATUS_SUCCESS;
+}
+
+#endif /* CFG_SUPPORT_PASSPOINT */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ *
+ * (C) COPYRIGHT 2014-2015 ARM Limited. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * A copy of the licence is included with the program, and can also be obtained
+ * from Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA  02110-1301, USA.
+ *
+ */
+
+
+
+#include "mali_kbase_cpu_vexpress.h"
+
+/**
+ * Maximum frequency GPU will be clocked at. Given in kHz.
+ * This must be specified as there is no default value.
+ *
+ * Attached value: number in kHz
+ * Default value: NA
+ */
+#define GPU_FREQ_KHZ_MAX 10000
+/**
+ * Minimum frequency GPU will be clocked at. Given in kHz.
+ * This must be specified as there is no default value.
+ *
+ * Attached value: number in kHz
+ * Default value: NA
+ */
+#define GPU_FREQ_KHZ_MIN 10000
+
+/**
+ * CPU_SPEED_FUNC - A pointer to a function that calculates the CPU clock
+ *
+ * CPU clock speed of the platform is in MHz - see kbase_cpu_clk_speed_func
+ * for the function prototype.
+ *
+ * Attached value: A kbase_cpu_clk_speed_func.
+ * Default Value:  NA
+ */
+#define CPU_SPEED_FUNC (&kbase_get_vexpress_cpu_clock_speed)
+
+/**
+ * GPU_SPEED_FUNC - A pointer to a function that calculates the GPU clock
+ *
+ * GPU clock speed of the platform in MHz - see kbase_gpu_clk_speed_func
+ * for the function prototype.
+ *
+ * Attached value: A kbase_gpu_clk_speed_func.
+ * Default Value:  NA
+ */
+#define GPU_SPEED_FUNC (NULL)
+
+/**
+ * Power management configuration
+ *
+ * Attached value: pointer to @ref kbase_pm_callback_conf
+ * Default value: See @ref kbase_pm_callback_conf
+ */
+#define POWER_MANAGEMENT_CALLBACKS (&pm_callbacks)
+
+/**
+ * Platform specific configuration functions
+ *
+ * Attached value: pointer to @ref kbase_platform_funcs_conf
+ * Default value: See @ref kbase_platform_funcs_conf
+ */
+#define PLATFORM_FUNCS (NULL)
+
+/** Power model for IPA
+ *
+ * Attached value: pointer to @ref mali_pa_model_ops
+ */
+#define POWER_MODEL_CALLBACKS (NULL)
+
+/**
+ * Secure mode switch
+ *
+ * Attached value: pointer to @ref kbase_secure_ops
+ */
+#define SECURE_CALLBACKS (NULL)
+
+extern struct kbase_pm_callback_conf pm_callbacks;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /**************************************************************************/ /*!
+@File
+@Title          Device Memory Management
+@Copyright      Copyright (c) Imagination Technologies Ltd. All Rights Reserved
+@Description    Header file utilities that are specific to device memory functions
+@License        Dual MIT/GPLv2
+
+The contents of this file are subject to the MIT license as set out below.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+Alternatively, the contents of this file may be used under the terms of
+the GNU General Public License Version 2 ("GPL") in which case the provisions
+of GPL are applicable instead of those above.
+
+If you wish to allow use of your version of this file only under the terms of
+GPL, and not to allow others to use your version of this file under the terms
+of the MIT license, indicate your decision by deleting the provisions above
+and replace them with the notice and other provisions required by GPL as set
+out in the file called "GPL-COPYING" included in this distribution. If you do
+not delete the provisions above, a recipient may use your version of this file
+under the terms of either the MIT license or GPL.
+
+This License is also included in this distribution in the file called
+"MIT-COPYING".
+
+EXCEPT AS OTHERWISE STATED IN A NEGOTIATED AGREEMENT: (A) THE SOFTWARE IS
+PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT; AND (B) IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/ /***************************************************************************/
+
+#include "img_defs.h"
+#include "img_types.h"
+#include "device.h"
+#include "pvrsrv_memallocflags.h"
+#include "pvrsrv.h"
+
+static INLINE IMG_UINT32 DevmemCPUCacheMode(PVRSRV_DEVICE_NODE *psDeviceNode,
+											PVRSRV_MEMALLOCFLAGS_T ulFlags)
+{
+	IMG_UINT32 ui32CPUCacheMode = PVRSRV_CPU_CACHE_MODE(ulFlags);
+	IMG_UINT32 ui32Ret;
+
+	PVR_ASSERT(ui32CPUCacheMode == PVRSRV_CPU_CACHE_MODE(ulFlags));
+
+	switch (ui32CPUCacheMode)
+	{
+		case PVRSRV_MEMALLOCFLAG_CPU_UNCACHED:
+			ui32Ret = PVRSRV_MEMALLOCFLAG_CPU_UNCACHED;
+			break;
+
+		case PVRSRV_MEMALLOCFLAG_CPU_WRITE_COMBINE:
+			ui32Ret = PVRSRV_MEMALLOCFLAG_CPU_WRITE_COMBINE;
+			break;
+
+		case PVRSRV_MEMALLOCFLAG_CPU_CACHE_INCOHERENT:
+			ui32Ret = PVRSRV_MEMALLOCFLAG_CPU_CACHED;
+			break;
+
+		case PVRSRV_MEMALLOCFLAG_CPU_CACHE_COHERENT:
+
+			/*
+				If system has no coherency but coherency has been requested for CPU
+				and GPU we currently have to fall back to uncached.
+			*/
+			if ( (PVRSRV_GPU_CACHE_MODE(ulFlags) == PVRSRV_MEMALLOCFLAG_GPU_CACHE_COHERENT) &&
+				!(PVRSRVSystemSnoopingOfCPUCache(psDeviceNode->psDevConfig) && PVRSRVSystemSnoopingOfDeviceCache(psDeviceNode->psDevConfig)) )
+			{
+				ui32Ret = PVRSRV_MEMALLOCFLAG_CPU_UNCACHED;
+			}
+			else
+			{
+				ui32Ret = PVRSRV_MEMALLOCFLAG_CPU_CACHED;
+			}
+
+			break;
+			break;
+
+		default:
+			PVR_LOG(("DevmemCPUCacheMode: Unknown CPU cache mode 0x%08x", ui32CPUCacheMode));
+			PVR_ASSERT(0);
+			/*
+				We should never get here, but if we do then setting the mode
+				to uncached is the safest thing to do.
+			*/
+			ui32Ret = PVRSRV_MEMALLOCFLAG_CPU_UNCACHED;
+			break;
+	}
+
+	return ui32Ret;
+}
+
+static INLINE IMG_UINT32 DevmemDeviceCacheMode(PVRSRV_DEVICE_NODE *psDeviceNode,
+											   PVRSRV_MEMALLOCFLAGS_T ulFlags)
+{
+	IMG_UINT32 ui32DeviceCacheMode = PVRSRV_GPU_CACHE_MODE(ulFlags);
+	IMG_UINT32 ui32Ret;
+
+	PVR_ASSERT(ui32DeviceCacheMode == PVRSRV_GPU_CACHE_MODE(ulFlags));
+
+	switch (ui32DeviceCacheMode)
+	{
+		case PVRSRV_MEMALLOCFLAG_GPU_UNCACHED:
+			ui32Ret = PVRSRV_MEMALLOCFLAG_GPU_UNCACHED;
+			break;
+
+		case PVRSRV_MEMALLOCFLAG_GPU_WRITE_COMBINE:
+			ui32Ret = PVRSRV_MEMALLOCFLAG_GPU_WRITE_COMBINE;
+			break;
+
+		case PVRSRV_MEMALLOCFLAG_GPU_CACHE_INCOHERENT:
+			ui32Ret = PVRSRV_MEMALLOCFLAG_GPU_CACHED;
+			break;
+
+		case PVRSRV_MEMALLOCFLAG_GPU_CACHE_COHERENT:
+
+			/*
+				If system has no coherency but coherency has been requested for CPU
+				and GPU we currently have to fall back to uncached.
+			*/
+			if ( (PVRSRV_CPU_CACHE_MODE(ulFlags) == PVRSRV_MEMALLOCFLAG_CPU_CACHE_COHERENT) &&
+				!(PVRSRVSystemSnoopingOfCPUCache(psDeviceNode->psDevConfig) && PVRSRVSystemSnoopingOfDeviceCache(psDeviceNode->psDevConfig)) )
+			{
+				ui32Ret = PVRSRV_MEMALLOCFLAG_GPU_UNCACHED;
+			}
+			else
+			{
+				ui32Ret = PVRSRV_MEMALLOCFLAG_GPU_CACHED;
+			}
+
+			break;
+
+		default:
+			PVR_LOG(("DevmemDeviceCacheMode: Unknown device cache mode 0x%08x", ui32DeviceCacheMode));
+			PVR_ASSERT(0);
+			/*
+				We should never get here, but if we do then setting the mode
+				to uncached is the safest thing to do.
+			*/
+			ui32Ret = PVRSRV_MEMALLOCFLAG_GPU_UNCACHED;
+			break;
+	}
+
+	return ui32Ret;
+}
+
+static INLINE IMG_BOOL DevmemCPUCacheCoherency(PVRSRV_DEVICE_NODE *psDeviceNode,
+											   PVRSRV_MEMALLOCFLAGS_T ulFlags)
+{
+	IMG_UINT32 ui32CPUCacheMode = PVRSRV_CPU_CACHE_MODE(ulFlags);
+	IMG_BOOL bRet = IMG_FALSE;
+
+	PVR_ASSERT(ui32CPUCacheMode == PVRSRV_CPU_CACHE_MODE(ulFlags));
+
+	if (ui32CPUCacheMode == PVRSRV_MEMALLOCFLAG_CPU_CACHE_COHERENT)
+	{
+		bRet = PVRSRVSystemSnoopingOfDeviceCache(psDeviceNode->psDevConfig);
+	}
+	return bRet;
+}
+
+static INLINE IMG_BOOL DevmemDeviceCacheCoherency(PVRSRV_DEVICE_NODE *psDeviceNode,
+												  PVRSRV_MEMALLOCFLAGS_T ulFlags)
+{
+	IMG_UINT32 ui32DeviceCacheMode = PVRSRV_GPU_CACHE_MODE(ulFlags);
+	IMG_BOOL bRet = IMG_FALSE;
+
+	PVR_ASSERT(ui32DeviceCacheMode == PVRSRV_GPU_CACHE_MODE(ulFlags));
+
+	if (ui32DeviceCacheMode == PVRSRV_MEMALLOCFLAG_GPU_CACHE_COHERENT)
+	{
+		bRet = PVRSRVSystemSnoopingOfCPUCache(psDeviceNode->psDevConfig);
+	}
+	return bRet;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * Copyright (C) 2015 MediaTek Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+
+#include <asm/io.h>
+#include <linux/string.h>
+#include "mt_smi.h"
+#include "smi_configuration.h"
+#include "smi_common.h"
+#include "smi_reg.h"
+
+/* add static after all platform setting parameters moved to here */
+
+
+#define SMI_LARB_NUM_MAX 8
+
+#if defined(SMI_D1)
+unsigned int smi_dbg_disp_mask = 1 << 0;
+unsigned int smi_dbg_vdec_mask = 1 << 1;
+unsigned int smi_dbg_imgsys_mask = 1 << 2;
+unsigned int smi_dbg_venc_mask = 1 << 3;
+unsigned int smi_dbg_mjc_mask = 0;
+
+unsigned long smi_common_l1arb_offset[SMI_LARB_NR] = {
+	REG_OFFSET_SMI_L1ARB0, REG_OFFSET_SMI_L1ARB1, REG_OFFSET_SMI_L1ARB2, REG_OFFSET_SMI_L1ARB3
+};
+
+
+struct SMI_CLK_INFO smi_clk_info[SMI_CLK_CNT] = {
+	{"MTCMOS", 0, 0x060C}, {"DISP", 0, 0}, {"VDEC", 0, 0x8}, {"ISP", 0, 0}, {"VENC", 0, 0},
+	{"", 0, 0}, {"", 0, 0}, {"", 0, 0}
+};
+unsigned long smi_larb0_debug_offset[SMI_LARB0_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb1_debug_offset[SMI_LARB1_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb2_debug_offset[SMI_LARB2_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb3_debug_offset[SMI_LARB3_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_common_debug_offset[SMI_COMMON_DEBUG_OFFSET_NUM] = {
+	0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x220, 0x230, 0x234, 0x238, 0x300, 0x400, 0x404, 0x408,
+	0x40C, 0x430, 0x440
+};
+
+int smi_larb_debug_offset_num[SMI_LARB_NR] = {
+	SMI_LARB0_DEBUG_OFFSET_NUM, SMI_LARB1_DEBUG_OFFSET_NUM, SMI_LARB2_DEBUG_OFFSET_NUM,
+	SMI_LARB3_DEBUG_OFFSET_NUM
+};
+
+unsigned long *smi_larb_debug_offset[SMI_LARB_NR] = {
+	smi_larb0_debug_offset, smi_larb1_debug_offset, smi_larb2_debug_offset,
+	smi_larb3_debug_offset
+};
+
+unsigned int smi_restore_num[SMI_LARB_NR];
+struct SMI_SETTING_VALUE *smi_larb_restore[SMI_LARB_NR];
+
+#define SMI_PROFILE_SETTING_COMMON_INIT_NUM 7
+
+#define SMI_INITSETTING_LARB0_NUM (SMI_LARB0_PORT_NUM + 1) /* add vc setting */
+#define SMI_INITSETTING_LARB1_NUM (SMI_LARB1_PORT_NUM + 1) /* add vc setting */
+#define SMI_INITSETTING_LARB2_NUM (SMI_LARB2_PORT_NUM + 2) /* add vc&isp_hrt setting */
+#define SMI_INITSETTING_LARB3_NUM (SMI_LARB3_PORT_NUM + 1) /* add vc setting */
+
+/* vc setting */
+struct SMI_SETTING_VALUE smi_vc_setting[SMI_VC_SETTING_NUM] = {
+	{0x20, 0}, {0x20, 2}, {0x20, 1}, {0x20, 1}
+};
+/* init_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_init[SMI_PROFILE_SETTING_COMMON_INIT_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0}, {REG_OFFSET_SMI_L1ARB1, 0x1000},
+	{REG_OFFSET_SMI_L1ARB2, 0x1000}, {REG_OFFSET_SMI_L1ARB3, 0x1000},
+	{0x100, 0x1b},
+	{0x234, (0x1 << 31) + (0x1d << 26) + (0x1f << 21) + (0x0 << 20) + (0x3 << 15)
+	 + (0x4 << 10) + (0x4 << 5) + 0x5},
+	{0x230, 0x1f + (0x8 << 4) + (0x7 << 9)}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_init[SMI_INITSETTING_LARB0_NUM] = {
+	{0x20, 0}, {0x200, 0x1f}, {0x204, 4}, {0x208, 6}, {0x20c, 0x1f}, {0x210, 4}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_init[SMI_INITSETTING_LARB1_NUM] = {
+	{0x20, 2}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_init[SMI_INITSETTING_LARB2_NUM] = {
+	{0x20, 1}, {0x24, 0x370246}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1},
+	{0x21c, 1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_init[SMI_INITSETTING_LARB3_NUM] = {
+	{0x20, 1}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING init_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM, SMI_INITSETTING_LARB3_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VR_NUM SMI_LARB_NR
+/* vr_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vr[SMI_PROFILE_SETTING_COMMON_VR_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x11F1}, {REG_OFFSET_SMI_L1ARB1, 0x1000},
+	{REG_OFFSET_SMI_L1ARB2, 0x120A}, {REG_OFFSET_SMI_L1ARB3, 0x11F3}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vr[SMI_LARB0_PORT_NUM] = {
+	{0x200, 8}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 2}, {0x218, 4}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vr[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vr[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 4}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 4}, {0x22c, 1}, {0x230, 2}, {0x234, 2}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vr[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 2}, {0x228, 1}, {0x22c, 3}, {0x230, 2}
+};
+
+struct SMI_SETTING vr_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VP_NUM SMI_LARB_NR
+/* vp_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vp[SMI_PROFILE_SETTING_COMMON_VP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x1262}, {REG_OFFSET_SMI_L1ARB1, 0x11E9},
+	{REG_OFFSET_SMI_L1ARB2, 0x1000}, {REG_OFFSET_SMI_L1ARB3, 0x123D}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 8}, {0x204, 1}, {0x208, 2}, {0x20c, 1}, {0x210, 3}, {0x214, 1}, {0x218, 4}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 0xb}, {0x204, 0xe}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vp[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 3}, {0x230, 2}
+};
+
+struct SMI_SETTING vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+/* vr series */
+struct SMI_SETTING icfp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+struct SMI_SETTING vr_slow_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+struct SMI_SETTING venc_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+/* vp series */
+struct SMI_SETTING vpwfd_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+struct SMI_SETTING swdec_vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+/* init series */
+struct SMI_SETTING mm_gpu_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM, SMI_INITSETTING_LARB3_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init}
+};
+
+struct SMI_SETTING ui_idle_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi4k_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vss_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING n3d_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpmjc_setting_config = { 0, NULL, {0}, {0} };
+
+#elif defined(SMI_D3)
+unsigned int smi_dbg_disp_mask = 1 << 0;
+unsigned int smi_dbg_vdec_mask = 1 << 1;
+unsigned int smi_dbg_imgsys_mask = 1 << 2;
+unsigned int smi_dbg_venc_mask = 1 << 3;
+unsigned int smi_dbg_mjc_mask = 0;
+
+unsigned long smi_common_l1arb_offset[SMI_LARB_NR] = {
+	REG_OFFSET_SMI_L1ARB0, REG_OFFSET_SMI_L1ARB1, REG_OFFSET_SMI_L1ARB2, REG_OFFSET_SMI_L1ARB3
+};
+
+struct SMI_CLK_INFO smi_clk_info[SMI_CLK_CNT] = {
+	{"MTCMOS", 0, 0x060C}, {"DISP", 0, 0}, {"VDEC", 0, 0x8}, {"ISP", 0, 0}, {"VENC", 0, 0},
+	{"", 0, 0}, {"", 0, 0}, {"", 0, 0}
+};
+
+unsigned long smi_larb0_debug_offset[SMI_LARB0_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb1_debug_offset[SMI_LARB1_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb2_debug_offset[SMI_LARB2_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb3_debug_offset[SMI_LARB3_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_common_debug_offset[SMI_COMMON_DEBUG_OFFSET_NUM] = {
+	0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x220, 0x230, 0x234, 0x238, 0x300, 0x400, 0x404, 0x408,
+	0x40C, 0x430, 0x440
+};
+
+int smi_larb_debug_offset_num[SMI_LARB_NR] = {
+	SMI_LARB0_DEBUG_OFFSET_NUM, SMI_LARB1_DEBUG_OFFSET_NUM, SMI_LARB2_DEBUG_OFFSET_NUM,
+	SMI_LARB3_DEBUG_OFFSET_NUM
+};
+
+unsigned long *smi_larb_debug_offset[SMI_LARB_NR] = {
+	smi_larb0_debug_offset, smi_larb1_debug_offset, smi_larb2_debug_offset,
+	smi_larb3_debug_offset
+};
+
+unsigned int smi_restore_num[SMI_LARB_NR];
+struct SMI_SETTING_VALUE *smi_larb_restore[SMI_LARB_NR];
+
+#define SMI_PROFILE_SETTING_COMMON_INIT_NUM 7
+
+#define SMI_INITSETTING_LARB0_NUM (SMI_LARB0_PORT_NUM + 1) /* add vc setting */
+#define SMI_INITSETTING_LARB1_NUM (SMI_LARB1_PORT_NUM + 1) /* add vc setting */
+#define SMI_INITSETTING_LARB2_NUM (SMI_LARB2_PORT_NUM + 2) /* add vc&isp_hrt setting */
+#define SMI_INITSETTING_LARB3_NUM (SMI_LARB3_PORT_NUM + 1) /* add vc setting */
+
+/* vc setting */
+struct SMI_SETTING_VALUE smi_vc_setting[SMI_VC_SETTING_NUM] = {
+	{0x20, 0}, {0x20, 2}, {0x20, 1}, {0x20, 1}
+};
+
+/* init_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_init[SMI_PROFILE_SETTING_COMMON_INIT_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0}, {REG_OFFSET_SMI_L1ARB1, 0x1000},
+	{REG_OFFSET_SMI_L1ARB2, 0x1000}, {REG_OFFSET_SMI_L1ARB3, 0x1000},
+	{0x100, 0xb},
+	{0x234, (0x1 << 31) + (0x1d << 26) + (0x1f << 21) + (0x0 << 20) + (0x3 << 15)
+	 + (0x4 << 10) + (0x4 << 5) + 0x5},
+	{0x230, 0xf + (0x8 << 4) + (0x7 << 9)}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_init[SMI_INITSETTING_LARB0_NUM] = {
+	{0x20, 0}, {0x200, 0x1f}, {0x204, 8}, {0x208, 6}, {0x20c, 0x1f}, {0x210, 4}, {0x214, 1}, {0x218, 1},
+	    {0x21c, 2},
+	{0x220, 1}, {0x224, 3}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_init[SMI_INITSETTING_LARB1_NUM] = {
+	{0x20, 2}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_init[SMI_INITSETTING_LARB2_NUM] = {
+	{0x20, 1}, {0x24, 0x370246}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1},
+	{0x21c, 1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_init[SMI_INITSETTING_LARB3_NUM] = {
+	{0x20, 1}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING init_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM, SMI_INITSETTING_LARB3_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VR_NUM SMI_LARB_NR
+/* vr_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vr[SMI_PROFILE_SETTING_COMMON_VR_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x1417}, {REG_OFFSET_SMI_L1ARB1, 0x1000},
+	{REG_OFFSET_SMI_L1ARB2, 0x11D0}, {REG_OFFSET_SMI_L1ARB3, 0x11F8}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vr[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0xa}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1},
+	    {0x21c, 4},
+	{0x220, 1}, {0x224, 6}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vr[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vr[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 2}, {0x21c,
+											     1},
+	{0x220, 2}, {0x224, 1}, {0x228, 1}, {0x22c, 8}, {0x230, 1}, {0x234, 1}, {0x238, 2}, {0x23c,
+											     2},
+	{0x240, 2}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vr[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 2}, {0x228, 1}, {0x22c, 3}, {0x230, 2}
+};
+
+struct SMI_SETTING vr_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VP_NUM SMI_LARB_NR
+/* vp_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vp[SMI_PROFILE_SETTING_COMMON_VP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x1262}, {REG_OFFSET_SMI_L1ARB1, 0x11E9},
+	{REG_OFFSET_SMI_L1ARB2, 0x1000}, {REG_OFFSET_SMI_L1ARB3, 0x123D}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 8}, {0x204, 1}, {0x208, 2}, {0x20c, 1}, {0x210, 3}, {0x214, 1}, {0x218, 4}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 0xb}, {0x204, 0xe}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vp[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 3}, {0x230, 2}
+};
+
+struct SMI_SETTING vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VPWFD_NUM SMI_LARB_NR
+/* vpwfd_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vpwfd[SMI_PROFILE_SETTING_COMMON_VPWFD_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x14B6}, {REG_OFFSET_SMI_L1ARB1, 0x11EE},
+	{REG_OFFSET_SMI_L1ARB2, 0x1000}, {REG_OFFSET_SMI_L1ARB3, 0x11F2}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vpwfd[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0xc}, {0x204, 8}, {0x208, 6}, {0x20c, 0xc}, {0x210, 4}, {0x214, 1}, {0x218, 1},
+	    {0x21c, 3},
+	{0x220, 2}, {0x224, 5}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vpwfd[SMI_LARB1_PORT_NUM] = {
+	{0x200, 0xb}, {0x204, 0xe}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vpwfd[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vpwfd[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 2}, {0x228, 1}, {0x22c, 3}, {0x230, 2}
+};
+
+struct SMI_SETTING vpwfd_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VPWFD_NUM, smi_profile_setting_common_vpwfd,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vpwfd, smi_profile_setting_larb1_vpwfd,
+	 smi_profile_setting_larb2_vpwfd, smi_profile_setting_larb3_vpwfd}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_ICFP_NUM SMI_LARB_NR
+/* icfp_setting */
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_icfp[SMI_PROFILE_SETTING_COMMON_ICFP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x14E2}, {REG_OFFSET_SMI_L1ARB1, 0x1000},
+	{REG_OFFSET_SMI_L1ARB2, 0x1310}, {REG_OFFSET_SMI_L1ARB3, 0x106F}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_icfp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0xe}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1},
+	    {0x21c, 2},
+	{0x220, 2}, {0x224, 3}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_icfp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_icfp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 0xc}, {0x204, 4}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1},
+	    {0x21c, 1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 3}, {0x230, 1}, {0x234, 1}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_icfp[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING icfp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_ICFP_NUM, smi_profile_setting_common_icfp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_icfp, smi_profile_setting_larb1_icfp,
+	 smi_profile_setting_larb2_icfp, smi_profile_setting_larb3_icfp}
+};
+
+/* vr series */
+struct SMI_SETTING vr_slow_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+struct SMI_SETTING venc_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+/* vp series */
+struct SMI_SETTING swdec_vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+/* init seris */
+struct SMI_SETTING mm_gpu_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM, SMI_INITSETTING_LARB3_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init}
+};
+
+struct SMI_SETTING vss_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING ui_idle_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi4k_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING n3d_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpmjc_setting_config = { 0, NULL, {0}, {0} };
+
+#elif defined(SMI_J)
+unsigned int smi_dbg_disp_mask = 1 << 0;
+unsigned int smi_dbg_vdec_mask = 1 << 1;
+unsigned int smi_dbg_imgsys_mask = 1 << 2;
+unsigned int smi_dbg_venc_mask = 1 << 3;
+unsigned int smi_dbg_mjc_mask = 0;
+
+unsigned long smi_common_l1arb_offset[SMI_LARB_NR] = {
+	REG_OFFSET_SMI_L1ARB0, REG_OFFSET_SMI_L1ARB1, REG_OFFSET_SMI_L1ARB2, REG_OFFSET_SMI_L1ARB3
+};
+
+struct SMI_CLK_INFO smi_clk_info[SMI_CLK_CNT] = {
+	{"MTCMOS", 0, 0x060C}, {"DISP", 0, 0}, {"VDEC", 0, 0x8}, {"ISP", 0, 0}, {"VENC", 0, 0},
+	{"", 0, 0}, {"", 0, 0}, {"", 0, 0}
+};
+
+unsigned long smi_larb0_debug_offset[SMI_LARB0_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb1_debug_offset[SMI_LARB1_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb2_debug_offset[SMI_LARB2_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb3_debug_offset[SMI_LARB3_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_common_debug_offset[SMI_COMMON_DEBUG_OFFSET_NUM] = {
+	0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x220, 0x230, 0x234, 0x238, 0x300, 0x400, 0x404, 0x408,
+	0x40C, 0x430, 0x440
+};
+
+int smi_larb_debug_offset_num[SMI_LARB_NR] = {
+	SMI_LARB0_DEBUG_OFFSET_NUM, SMI_LARB1_DEBUG_OFFSET_NUM, SMI_LARB2_DEBUG_OFFSET_NUM,
+	SMI_LARB3_DEBUG_OFFSET_NUM
+};
+
+unsigned long *smi_larb_debug_offset[SMI_LARB_NR] = {
+	smi_larb0_debug_offset, smi_larb1_debug_offset, smi_larb2_debug_offset,
+	smi_larb3_debug_offset
+};
+
+unsigned int smi_restore_num[SMI_LARB_NR];
+struct SMI_SETTING_VALUE *smi_larb_restore[SMI_LARB_NR];
+
+#define SMI_PROFILE_SETTING_COMMON_INIT_NUM 8
+
+#define SMI_INITSETTING_LARB0_NUM (SMI_LARB0_PORT_NUM + 7) /* add ui_critical/vc/cmd throttle setting */
+#define SMI_INITSETTING_LARB1_NUM (SMI_LARB1_PORT_NUM + 3) /* add vc/cmd throttle setting */
+#define SMI_INITSETTING_LARB2_NUM (SMI_LARB2_PORT_NUM + 3) /* add vc/cmd throttle setting */
+#define SMI_INITSETTING_LARB3_NUM (SMI_LARB3_PORT_NUM + 3) /* add vc/cmd throttle setting */
+
+/* vc setting */
+struct SMI_SETTING_VALUE smi_vc_setting[SMI_VC_SETTING_NUM] = {
+	{0x20, 0}, {0x20, 2}, {0x20, 1}, {0x20, 1}
+};
+
+/* init_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_init[SMI_PROFILE_SETTING_COMMON_INIT_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x15AE}, {REG_OFFSET_SMI_L1ARB1, 0x1000},
+	{REG_OFFSET_SMI_L1ARB2, 0x1000}, {REG_OFFSET_SMI_L1ARB3, 0x1000},
+	{0x100, 0xb},
+	{0x234, ((0x1 << 31) + (0x1d << 26) + (0x1f << 21) + (0x0 << 20) + (0x3 << 15)
+		 + (0x4 << 10) + (0x4 << 5) + 0x5)},
+	{0x230, 0xf + (0x8 << 4) + (0x7 << 9)},
+	{0x300, 0x1 + (0x78 << 1) + (0x4 << 8)}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_init[SMI_INITSETTING_LARB0_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x20, 0}, {0x24, 0x370246},
+	{0x200, 0x1f}, {0x204, 8}, {0x208, 6}, {0x20c, 0x1f}, {0x210, 4}, {0x214, 1}, {0x218, 0x1f},
+	    {0x21c, 0x1f},
+	{0x220, 2}, {0x224, 1}, {0x228, 3}, {0x100, 5}, {0x10c, 5}, {0x118, 5}, {0x11c, 5}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_init[SMI_INITSETTING_LARB1_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x20, 2}, {0x24, 0x370246}, {0x200, 1}, {0x204, 1},
+	{0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_init[SMI_INITSETTING_LARB2_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x20, 1}, {0x24, 0x370246},
+	{0x200, 1}, {0x204, 4}, {0x208, 2}, {0x20c, 2}, {0x210, 2}, {0x214, 1}, {0x218, 2}, {0x21c,
+											     2},
+	{0x220, 2}, {0x224, 1}, {0x228, 1}, {0x22c, 2}, {0x230, 1}, {0x234, 2}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_init[SMI_INITSETTING_LARB3_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x20, 1}, {0x24, 0x370246},
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING init_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM, SMI_INITSETTING_LARB3_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VR_NUM SMI_LARB_NR
+
+/* vr_setting */
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vr[SMI_PROFILE_SETTING_COMMON_VR_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x1393}, {REG_OFFSET_SMI_L1ARB1, 0x1000},
+	{REG_OFFSET_SMI_L1ARB2, 0x1205}, {REG_OFFSET_SMI_L1ARB3, 0x11D4}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vr[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0xe}, {0x204, 8}, {0x208, 4}, {0x20c, 0xe}, {0x210, 4}, {0x214, 1}, {0x218, 0xe},
+	    {0x21c, 0xe},
+	{0x220, 2}, {0x224, 1}, {0x228, 2}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vr[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vr[SMI_LARB2_PORT_NUM] = {
+	{0x200, 0x12}, {0x204, 6}, {0x208, 4}, {0x20c, 2}, {0x210, 4}, {0x214, 1}, {0x218, 4}, {0x21c,
+											     2},
+	{0x220, 2}, {0x224, 1}, {0x228, 1}, {0x22c, 2}, {0x230, 1}, {0x234, 2}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vr[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 2}, {0x228, 1}, {0x22c, 1}, {0x230, 4}
+};
+
+struct SMI_SETTING vr_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VP_NUM SMI_LARB_NR
+
+/* vp_setting */
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vp[SMI_PROFILE_SETTING_COMMON_VP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x1510}, {REG_OFFSET_SMI_L1ARB1, 0x1169},
+	{REG_OFFSET_SMI_L1ARB2, 0x1000}, {REG_OFFSET_SMI_L1ARB3, 0x11CE}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0xc}, {0x204, 8}, {0x208, 4}, {0x20c, 0xc}, {0x210, 4}, {0x214, 2}, {0x218, 0xc},
+	    {0x21c, 0xc},
+	{0x220, 2}, {0x224, 1}, {0x228, 3}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 5}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}, {0x23c,
+											     1},
+	{0x240, 1}, {0x244, 1}, {0x248, 1}, {0x24c, 1}, {0x250, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vp[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 2}, {0x228, 1}, {0x22c, 1}, {0x230, 4}
+};
+
+struct SMI_SETTING vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+/* vr series */
+struct SMI_SETTING icfp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+struct SMI_SETTING vr_slow_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+struct SMI_SETTING vss_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+struct SMI_SETTING venc_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr}
+};
+
+/* vp series */
+struct SMI_SETTING vpwfd_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+struct SMI_SETTING swdec_vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp}
+};
+
+/* init seris */
+struct SMI_SETTING mm_gpu_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init}
+};
+
+struct SMI_SETTING ui_idle_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi4k_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING n3d_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpmjc_setting_config = { 0, NULL, {0}, {0} };
+
+#elif defined(SMI_D2)
+unsigned int smi_dbg_disp_mask = 1 << 0;
+unsigned int smi_dbg_vdec_mask = 1 << 1;
+unsigned int smi_dbg_imgsys_mask = 1 << 2;
+unsigned int smi_dbg_venc_mask = 1 << 2;
+unsigned int smi_dbg_mjc_mask = 0;
+
+unsigned long smi_common_l1arb_offset[SMI_LARB_NR] = {
+	REG_OFFSET_SMI_L1ARB0, REG_OFFSET_SMI_L1ARB1, REG_OFFSET_SMI_L1ARB2
+};
+
+struct SMI_CLK_INFO smi_clk_info[SMI_CLK_CNT] = {
+	{"MTCMOS", 0, 0x060C}, {"DISP", 0, 0}, {"VDEC", 0, 0x8}, {"ISP", 0, 0}, {"VENC", 0, 0},
+	{"", 0, 0}, {"", 0, 0}, {"", 0, 0}
+};
+
+unsigned long smi_larb0_debug_offset[SMI_LARB0_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb1_debug_offset[SMI_LARB1_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb2_debug_offset[SMI_LARB2_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_common_debug_offset[SMI_COMMON_DEBUG_OFFSET_NUM] = {
+	0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x220, 0x230, 0x234, 0x238, 0x300, 0x400, 0x404, 0x408,
+	0x40C, 0x430, 0x440
+};
+
+int smi_larb_debug_offset_num[SMI_LARB_NR] = {
+	SMI_LARB0_DEBUG_OFFSET_NUM, SMI_LARB1_DEBUG_OFFSET_NUM, SMI_LARB2_DEBUG_OFFSET_NUM
+};
+
+unsigned long *smi_larb_debug_offset[SMI_LARB_NR] = {
+	smi_larb0_debug_offset, smi_larb1_debug_offset, smi_larb2_debug_offset
+};
+
+unsigned int smi_restore_num[SMI_LARB_NR];
+struct SMI_SETTING_VALUE *smi_larb_restore[SMI_LARB_NR];
+
+#define SMI_PROFILE_SETTING_COMMON_INIT_NUM 6
+#define SMI_VC_SETTING_INDEX 0
+
+#define SMI_INITSETTING_LARB0_NUM (SMI_LARB0_PORT_NUM + 1) /* add vc setting */
+#define SMI_INITSETTING_LARB1_NUM (SMI_LARB1_PORT_NUM + 1) /* add vc setting */
+#define SMI_INITSETTING_LARB2_NUM (SMI_LARB2_PORT_NUM + 1) /* add vc setting */
+
+/* vc setting */
+struct SMI_SETTING_VALUE smi_vc_setting[SMI_VC_SETTING_NUM] = {
+	{0x20, 0}, {0x20, 2}, {0x20, 1}
+};
+
+
+/* init_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_init[SMI_PROFILE_SETTING_COMMON_INIT_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0}, {REG_OFFSET_SMI_L1ARB1, 0}, {REG_OFFSET_SMI_L1ARB2, 0},
+	{0x100, 0xb},
+	{0x234, (0x1 << 31) + (0x1d << 26) + (0x1f << 21) + (0x0 << 20) + (0x3 << 15)
+	 + (0x4 << 10) + (0x4 << 5) + 0x5},
+	{0x230, (0x7 + (0x8 << 3) + (0x7 << 8))}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_init[SMI_INITSETTING_LARB0_NUM] = {
+	{0x20, 0}, {0x200, 0x1f}, {0x204, 0x1f}, {0x208, 4}, {0x20c, 6}, {0x210, 4}, {0x214, 1}, {0x218, 1},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_init[SMI_INITSETTING_LARB1_NUM] = {
+	{0x20, 2}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_init[SMI_INITSETTING_LARB2_NUM] = {
+	{0x20, 1}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING init_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_ICFP_NUM SMI_LARB_NR
+/* icfp_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_icfp[SMI_PROFILE_SETTING_COMMON_ICFP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x11da}, {REG_OFFSET_SMI_L1ARB1, 0x1000}, {REG_OFFSET_SMI_L1ARB2, 0x1318}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_icfp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 6}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_icfp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_icfp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 8}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 2}, {0x214, 4}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING icfp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_ICFP_NUM, smi_profile_setting_common_icfp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM},
+	{smi_profile_setting_larb0_icfp, smi_profile_setting_larb1_icfp,
+	 smi_profile_setting_larb2_icfp}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VR_NUM SMI_LARB_NR
+/* vr_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vr[SMI_PROFILE_SETTING_COMMON_VR_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x11ff}, {REG_OFFSET_SMI_L1ARB1, 0x1000}, {REG_OFFSET_SMI_L1ARB2, 0x1361}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vr[SMI_LARB0_PORT_NUM] = {
+	{0x200, 6}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vr[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vr[SMI_LARB2_PORT_NUM] = {
+	{0x200, 8}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 4}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 2}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING vr_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VP_NUM SMI_LARB_NR
+/* vp_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vp[SMI_PROFILE_SETTING_COMMON_VP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x11ff}, {REG_OFFSET_SMI_L1ARB1, 0}, {REG_OFFSET_SMI_L1ARB2, 0x1361}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 8}, {0x204, 8}, {0x208, 1}, {0x20c, 1}, {0x210, 3}, {0x214, 1}, {0x218, 4}, {0x21c,
+											     1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 0xb}, {0x204, 0xe}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 8}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 4}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 2}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VPWFD_NUM SMI_LARB_NR
+/* vfd_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_vpwfd[SMI_PROFILE_SETTING_COMMON_VPWFD_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x11ff}, {REG_OFFSET_SMI_L1ARB1, 0}, {REG_OFFSET_SMI_L1ARB2, 0x1361}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vpwfd[SMI_LARB0_PORT_NUM] = {
+	{0x200, 8}, {0x204, 8}, {0x208, 1}, {0x20c, 1}, {0x210, 3}, {0x214, 1}, {0x218, 4}, {0x21c,
+											     1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vpwfd[SMI_LARB1_PORT_NUM] = {
+	{0x200, 0xb}, {0x204, 0xe}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vpwfd[SMI_LARB2_PORT_NUM] = {
+	{0x200, 8}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 4}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 2}, {0x22c, 1}, {0x230, 1}
+};
+
+struct SMI_SETTING vpwfd_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VPWFD_NUM, smi_profile_setting_common_vpwfd,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM},
+	{smi_profile_setting_larb0_vpwfd, smi_profile_setting_larb1_vpwfd,
+	 smi_profile_setting_larb2_vpwfd}
+};
+
+/* vp series */
+struct SMI_SETTING swdec_vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp}
+};
+
+/* vr series */
+struct SMI_SETTING vr_slow_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr}
+};
+
+struct SMI_SETTING venc_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr}
+};
+
+/* init series */
+struct SMI_SETTING mm_gpu_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init}
+};
+struct SMI_SETTING vss_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING ui_idle_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi4k_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING n3d_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpmjc_setting_config = { 0, NULL, {0}, {0} };
+
+#elif defined(SMI_R)
+unsigned int smi_dbg_disp_mask = 1 << 0;
+unsigned int smi_dbg_vdec_mask = 0;
+unsigned int smi_dbg_imgsys_mask = 1 << 1;
+unsigned int smi_dbg_venc_mask = 1 << 1;
+unsigned int smi_dbg_mjc_mask = 0;
+
+unsigned long smi_common_l1arb_offset[SMI_LARB_NR] = {
+	REG_OFFSET_SMI_L1ARB0, REG_OFFSET_SMI_L1ARB1
+};
+
+struct SMI_CLK_INFO smi_clk_info[SMI_CLK_CNT] = {
+	{"MTCMOS", 0, 0x060C}, {"DISP", 0, 0}, {"VDEC", 0, 0x8}, {"ISP", 0, 0}, {"VENC", 0, 0},
+	{"", 0, 0}, {"", 0, 0}, {"", 0, 0}
+};
+
+unsigned long smi_larb0_debug_offset[SMI_LARB0_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb1_debug_offset[SMI_LARB1_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_common_debug_offset[SMI_COMMON_DEBUG_OFFSET_NUM] = {
+	0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x220, 0x230, 0x234, 0x238, 0x300, 0x400, 0x404, 0x408,
+	0x40C, 0x430, 0x440
+};
+
+int smi_larb_debug_offset_num[SMI_LARB_NR] = {
+	SMI_LARB0_DEBUG_OFFSET_NUM, SMI_LARB1_DEBUG_OFFSET_NUM
+};
+
+unsigned long *smi_larb_debug_offset[SMI_LARB_NR] = {
+	smi_larb0_debug_offset, smi_larb1_debug_offset
+};
+
+unsigned int smi_restore_num[SMI_LARB_NR];
+struct SMI_SETTING_VALUE *smi_larb_restore[SMI_LARB_NR];
+
+#define SMI_PROFILE_SETTING_COMMON_INIT_NUM 5
+#define SMI_VC_SETTING_INDEX 0
+
+#define SMI_INITSETTING_LARB0_NUM (SMI_LARB0_PORT_NUM + 1) /* add vc setting */
+#define SMI_INITSETTING_LARB1_NUM (SMI_LARB1_PORT_NUM + 1) /* add vc setting */
+
+/* vc setting */
+struct SMI_SETTING_VALUE smi_vc_setting[SMI_VC_SETTING_NUM] = {
+	{0x20, 0}, {0x20, 2}
+};
+
+/* init_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_init[SMI_PROFILE_SETTING_COMMON_INIT_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x14cb}, {REG_OFFSET_SMI_L1ARB1, 0x1001},
+	{0x100, 0xb},
+	{0x234,
+	 (0x1 << 31) + (0x1d << 26) + (0x1f << 21) + (0x0 << 20) + (0x3 << 15)
+	 + (0x4 << 10) + (0x4 << 5) + 0x5},
+	{0x230, (0x3 + (0x8 << 2) + (0x7 << 7))}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_init[SMI_INITSETTING_LARB0_NUM] = {
+	{0x20, 0}, {0x200, 0x1c}, {0x204, 4}, {0x208, 6}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_init[SMI_INITSETTING_LARB1_NUM] = {
+	{0x20, 2}, {0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}
+};
+
+struct SMI_SETTING init_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VR_NUM SMI_LARB_NR
+/* vr_setting */
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vr[SMI_PROFILE_SETTING_COMMON_VR_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x122b}, {REG_OFFSET_SMI_L1ARB1, 0x142c}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vr[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0xa}, {0x204, 1}, {0x208, 1}, {0x20c, 4}, {0x210, 2}, {0x214, 2}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vr[SMI_LARB1_PORT_NUM] = {
+	{0x200, 8}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 4}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 3}, {0x224, 2}, {0x228, 2}
+};
+
+struct SMI_SETTING vr_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr}
+};
+
+#define SMI_PROFILE_SETTING_COMMON_VP_NUM SMI_LARB_NR
+/* vp_setting */
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vp[SMI_PROFILE_SETTING_COMMON_VP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x11ff}, {REG_OFFSET_SMI_L1ARB1, 0}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 8}, {0x204, 1}, {0x208, 1}, {0x20c, 3}, {0x210, 1}, {0x214, 4}, {0x218, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 8}, {0x204, 6}, {0x208, 1}, {0x20c, 1}, {0x210, 4}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 3}, {0x224, 2}, {0x228, 2}
+};
+
+struct SMI_SETTING vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp}
+};
+
+/* vp series */
+struct SMI_SETTING swdec_vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp}
+};
+
+/* vr series */
+struct SMI_SETTING vr_slow_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr}
+};
+
+struct SMI_SETTING icfp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr}
+};
+
+struct SMI_SETTING venc_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr}
+};
+
+/* init series */
+struct SMI_SETTING mm_gpu_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init}
+};
+
+struct SMI_SETTING vss_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpwfd_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING ui_idle_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi4k_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING n3d_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpmjc_setting_config = { 0, NULL, {0}, {0} };
+
+#elif defined(SMI_EV)
+unsigned int smi_dbg_disp_mask = 0x21;
+unsigned int smi_dbg_vdec_mask = 1 << 1;
+unsigned int smi_dbg_imgsys_mask = 0x44;
+unsigned int smi_dbg_venc_mask = 1 << 3;
+unsigned int smi_dbg_mjc_mask = 1 << 4;
+
+struct SMI_CLK_INFO smi_clk_info[SMI_CLK_CNT] = {
+	{"MTCMOS", 0, 0x060C}, {"DISP", 0, 0}, {"VDEC", 0, 0x8}, {"ISP", 0, 0}, {"VENC", 0, 0},
+	{"", 0, 0}, {"", 0, 0}, {"", 0, 0}
+};
+
+unsigned long smi_common_l1arb_offset[SMI_LARB_NR] = {
+	REG_OFFSET_SMI_L1ARB0, REG_OFFSET_SMI_L1ARB1, REG_OFFSET_SMI_L1ARB2, REG_OFFSET_SMI_L1ARB3,
+	REG_OFFSET_SMI_L1ARB4, REG_OFFSET_SMI_L1ARB5, REG_OFFSET_SMI_L1ARB6
+};
+
+unsigned long smi_larb0_debug_offset[SMI_LARB0_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb1_debug_offset[SMI_LARB1_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb2_debug_offset[SMI_LARB2_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb3_debug_offset[SMI_LARB3_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb4_debug_offset[SMI_LARB4_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb5_debug_offset[SMI_LARB5_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+
+unsigned long smi_larb6_debug_offset[SMI_LARB6_DEBUG_OFFSET_NUM] = {
+	0x0, 0x8, 0x10, 0x14, 0x24, 0x50, 0x60, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+	    0xc8,
+	0xcc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c,
+	    0x230,
+	0x234, 0x238, 0x23c, 0x240, 0x244, 0x248, 0x24c, 0x280, 0x284, 0x288, 0x28c, 0x290, 0x294,
+	    0x298,
+	0x29c, 0x2a0, 0x2a4, 0x2a8, 0x2ac, 0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+	    0x2d0,
+	0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc
+};
+unsigned long smi_common_debug_offset[SMI_COMMON_DEBUG_OFFSET_NUM] = {
+	0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x118, 0x11c, 0x220, 0x230, 0x234, 0x238, 0x300, 0x400, 0x404, 0x408,
+	0x40C, 0x410, 0x414, 0x418, 0x430, 0x434, 0x440
+};
+
+int smi_larb_debug_offset_num[SMI_LARB_NR] = {
+	SMI_LARB0_DEBUG_OFFSET_NUM, SMI_LARB1_DEBUG_OFFSET_NUM, SMI_LARB2_DEBUG_OFFSET_NUM,
+	SMI_LARB3_DEBUG_OFFSET_NUM, SMI_LARB4_DEBUG_OFFSET_NUM, SMI_LARB5_DEBUG_OFFSET_NUM,
+	SMI_LARB6_DEBUG_OFFSET_NUM
+};
+
+unsigned long *smi_larb_debug_offset[SMI_LARB_NR] = {
+	smi_larb0_debug_offset, smi_larb1_debug_offset, smi_larb2_debug_offset,
+	smi_larb3_debug_offset, smi_larb4_debug_offset, smi_larb5_debug_offset,
+	smi_larb6_debug_offset
+};
+
+#define SMI_LARB0_RESTORE_NUM 5
+#define SMI_LARB1_RESTORE_NUM 0
+#define SMI_LARB2_RESTORE_NUM 0
+#define SMI_LARB3_RESTORE_NUM 0
+#define SMI_LARB4_RESTORE_NUM 0
+#define SMI_LARB5_RESTORE_NUM 4
+#define SMI_LARB6_RESTORE_NUM 0
+
+unsigned int smi_restore_num[SMI_LARB_NR] = {
+	SMI_LARB0_RESTORE_NUM, SMI_LARB1_RESTORE_NUM, SMI_LARB2_RESTORE_NUM, SMI_LARB3_RESTORE_NUM,
+	SMI_LARB4_RESTORE_NUM, SMI_LARB5_RESTORE_NUM, SMI_LARB6_RESTORE_NUM
+};
+struct SMI_SETTING_VALUE smi_larb0_restore[SMI_LARB0_RESTORE_NUM] = {
+	{0x100, 0xb}, {0x104, 0xb}, {0x108, 0xb}, {0x110, 5}, {0x118, 2}
+};
+
+struct SMI_SETTING_VALUE smi_larb5_restore[SMI_LARB5_RESTORE_NUM] = {
+	{0x100, 0xb}, {0x104, 0xb}, {0x108, 0xb}, {0x118, 0xb}
+};
+
+struct SMI_SETTING_VALUE *smi_larb_restore[SMI_LARB_NR] = {
+	smi_larb0_restore,
+	NULL,
+	NULL,
+	NULL,
+	NULL,
+	smi_larb5_restore,
+	NULL
+};
+
+#define SMI_PROFILE_SETTING_COMMON_INIT_NUM 13
+
+#define SMI_INITSETTING_LARB0_NUM (SMI_LARB0_PORT_NUM + 7) /* add cmd throttle setting/dcm/cmd grouping*/
+#define SMI_INITSETTING_LARB1_NUM (SMI_LARB1_PORT_NUM + 2) /* add cmd throttle setting/dcm*/
+#define SMI_INITSETTING_LARB2_NUM (SMI_LARB2_PORT_NUM + 2) /* add cmd throttle setting/dcm*/
+#define SMI_INITSETTING_LARB3_NUM (SMI_LARB3_PORT_NUM + 2) /* add cmd throttle setting/dcm*/
+#define SMI_INITSETTING_LARB4_NUM (SMI_LARB4_PORT_NUM + 2) /* add cmd throttle setting/dcm*/
+#define SMI_INITSETTING_LARB5_NUM (SMI_LARB5_PORT_NUM + 6) /* add cmd throttle setting/dcm/cmd grouping*/
+#define SMI_INITSETTING_LARB6_NUM (SMI_LARB6_PORT_NUM + 2) /* add cmd throttle setting/dcm*/
+
+/* vc setting */
+struct SMI_SETTING_VALUE smi_vc_setting[SMI_VC_SETTING_NUM] = {
+	{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}
+};
+/* init_setting */
+struct SMI_SETTING_VALUE smi_profile_setting_common_init[SMI_PROFILE_SETTING_COMMON_INIT_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x18FC}, {REG_OFFSET_SMI_L1ARB1, 0x1000}, {REG_OFFSET_SMI_L1ARB2, 0x1000},
+	{REG_OFFSET_SMI_L1ARB3, 0x1000}, {REG_OFFSET_SMI_L1ARB4, 0x1000}, {REG_OFFSET_SMI_L1ARB5, 0x126A},
+	{REG_OFFSET_SMI_L1ARB6, 0x1000},
+	{0x100, 0xb},
+	{0x220, 0x1554},
+	{0x234, ((0x1 << 31) + (0x1d << 26) + (0x1f << 21) + (0x0 << 20) + (0x3 << 15)
+		 + (0x4 << 10) + (0x4 << 5) + 0x5)},
+	{0x238, (0x2 << 25) + (0x3 << 20) + (0x4 << 15) + (0x5 << 10) + (0x7 << 5) + 0x8},
+	{0x230, 0x7f + (0x8 << 7) + (0x7 << 12)},
+	{0x300, 0x1 + (0x1 << 1) + (0x4 << 8)}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_init[SMI_INITSETTING_LARB0_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x24, 0x370246}, {0x100, 0xb}, {0x104, 0xb}, {0x108, 0xb},
+	{0x110, 5}, {0x118, 2},
+	{0x200, 0x1f}, {0x204, 0x1f}, {0x208, 0x1f}, {0x20c, 0xa}, {0x210, 1}, {0x214, 1}, {0x218, 1},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_init[SMI_INITSETTING_LARB1_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x24, 0x370246}, {0x200, 1}, {0x204, 1}, {0x208, 1},
+	{0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c, 1}, {0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_init[SMI_INITSETTING_LARB2_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x24, 0x370246},
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_init[SMI_INITSETTING_LARB3_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x24, 0x370246},
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb4_init[SMI_INITSETTING_LARB4_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x24, 0x370246},
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb5_init[SMI_INITSETTING_LARB5_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x24, 0x370246}, {0x100, 0xb}, {0x104, 0xb}, {0x108, 0xb},
+	{0x118, 0xb},
+	{0x200, 0x1f}, {0x204, 0x1f}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 6}, {0x214, 6}, {0x218, 0x1f}, {0x21c,
+											     7},
+	{0x220, 8}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb6_init[SMI_INITSETTING_LARB6_NUM] = {
+	{0x14, (0x7 << 8) + (0xf << 4)}, {0x24, 0x370246},
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+struct SMI_SETTING init_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM, SMI_INITSETTING_LARB3_NUM,
+		SMI_INITSETTING_LARB4_NUM, SMI_INITSETTING_LARB5_NUM, SMI_INITSETTING_LARB6_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init,
+	 smi_profile_setting_larb4_init, smi_profile_setting_larb5_init,
+	 smi_profile_setting_larb6_init}
+};
+
+/* VPMJC120 */
+#define SMI_PROFILE_SETTING_COMMON_VPMJC_NUM SMI_LARB_NR
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vpmjc[SMI_PROFILE_SETTING_COMMON_VPMJC_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x16DE}, {REG_OFFSET_SMI_L1ARB1, 0x115E}, {REG_OFFSET_SMI_L1ARB2, 0x1000},
+	{REG_OFFSET_SMI_L1ARB3, 0x1000}, {REG_OFFSET_SMI_L1ARB4, 0x134C}, {REG_OFFSET_SMI_L1ARB5, 0x12EC},
+	{REG_OFFSET_SMI_L1ARB6, 0x1000}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vpmjc[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0x1f}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 0xc}, {0x210, 3}, {0x214, 1}, {0x218, 0xa},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vpmjc[SMI_LARB1_PORT_NUM] = {
+	{0x200, 0xb}, {0x204, 2}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 2}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vpmjc[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vpmjc[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb4_vpmjc[SMI_LARB4_PORT_NUM] = {
+	{0x200, 6}, {0x204, 3}, {0x208, 7}, {0x20c, 3}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb5_vpmjc[SMI_LARB5_PORT_NUM] = {
+	{0x200, 6}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 6}, {0x214, 6}, {0x218, 6}, {0x21c,
+											     1},
+	{0x220, 3}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb6_vpmjc[SMI_LARB6_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+struct SMI_SETTING vpmjc_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VPMJC_NUM, smi_profile_setting_common_vpmjc,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vpmjc, smi_profile_setting_larb1_vpmjc, smi_profile_setting_larb2_vpmjc,
+	 smi_profile_setting_larb3_vpmjc, smi_profile_setting_larb4_vpmjc, smi_profile_setting_larb5_vpmjc,
+	 smi_profile_setting_larb6_vpmjc}
+};
+
+/* VP4K */
+#define SMI_PROFILE_SETTING_COMMON_VP_NUM SMI_LARB_NR
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vp[SMI_PROFILE_SETTING_COMMON_VP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x15B4}, {REG_OFFSET_SMI_L1ARB1, 0x058E}, {REG_OFFSET_SMI_L1ARB2, 0x1000},
+	{REG_OFFSET_SMI_L1ARB3, 0x1000}, {REG_OFFSET_SMI_L1ARB4, 0x1000}, {REG_OFFSET_SMI_L1ARB5, 0x126B},
+	{REG_OFFSET_SMI_L1ARB6, 0x1000}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0x1c}, {0x204, 5}, {0x208, 0x1f}, {0x20c, 0xa}, {0x210, 4}, {0x214, 1}, {0x218, 5},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 0x1f}, {0x204, 0x1f}, {0x208, 1}, {0x20c, 0x1f}, {0x210, 1}, {0x214, 0x1f}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vp[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb4_vp[SMI_LARB4_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb5_vp[SMI_LARB5_PORT_NUM] = {
+	{0x200, 5}, {0x204, 5}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 6}, {0x214, 6}, {0x218, 5}, {0x21c,
+											     0xa},
+	{0x220, 0xa}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb6_vp[SMI_LARB6_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+struct SMI_SETTING vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp, smi_profile_setting_larb4_vp, smi_profile_setting_larb5_vp,
+	 smi_profile_setting_larb6_vp}
+};
+
+/* VR4K */
+#define SMI_PROFILE_SETTING_COMMON_VR_NUM SMI_LARB_NR
+
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vr[SMI_PROFILE_SETTING_COMMON_VR_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x1477}, {REG_OFFSET_SMI_L1ARB1, 0x1000}, {REG_OFFSET_SMI_L1ARB2, 0x1198},
+	{REG_OFFSET_SMI_L1ARB3, 0x1444}, {REG_OFFSET_SMI_L1ARB4, 0x1000}, {REG_OFFSET_SMI_L1ARB5, 0x1000},
+	{REG_OFFSET_SMI_L1ARB6, 0x13f0}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vr[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0x1f}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 1}, {0x214, 4}, {0x218, 0xa},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vr[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vr[SMI_LARB2_PORT_NUM] = {
+	{0x200, 2}, {0x204, 0x1f}, {0x208, 2}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vr[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 4}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 6}, {0x228, 3}, {0x22c, 1}, {0x230, 0xd}, {0x234, 1}, {0x238, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb4_vr[SMI_LARB4_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb5_vr[SMI_LARB5_PORT_NUM] = {
+	{0x200, 6}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 6}, {0x214, 6}, {0x218, 6}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb6_vr[SMI_LARB6_PORT_NUM] = {
+	{0x200, 7}, {0x204, 1}, {0x208, 5}, {0x20c, 6}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+struct SMI_SETTING vr_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr, smi_profile_setting_larb4_vr, smi_profile_setting_larb5_vr,
+	 smi_profile_setting_larb6_vr}
+};
+
+/* SMVR120 */
+#define SMI_PROFILE_SETTING_COMMON_VR_SLOW_NUM SMI_LARB_NR
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_vr_slow[SMI_PROFILE_SETTING_COMMON_VR_SLOW_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x14ff}, {REG_OFFSET_SMI_L1ARB1, 0x1000}, {REG_OFFSET_SMI_L1ARB2, 0x1139},
+	{REG_OFFSET_SMI_L1ARB3, 0x148E}, {REG_OFFSET_SMI_L1ARB4, 0x1000}, {REG_OFFSET_SMI_L1ARB5, 0x1000},
+	{REG_OFFSET_SMI_L1ARB6, 0x1193}
+};
+
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_vr_slow[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0x1f}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 1}, {0x214, 4}, {0x218, 0xc},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_vr_slow[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_vr_slow[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 0xa}, {0x208, 2}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_vr_slow[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 4}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 6}, {0x228, 3}, {0x22c, 1}, {0x230, 0xd}, {0x234, 1}, {0x238, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb4_vr_slow[SMI_LARB4_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb5_vr_slow[SMI_LARB5_PORT_NUM] = {
+	{0x200, 6}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 6}, {0x214, 6}, {0x218, 6}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb6_vr_slow[SMI_LARB6_PORT_NUM] = {
+	{0x200, 7}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+struct SMI_SETTING vr_slow_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_SLOW_NUM, smi_profile_setting_common_vr_slow,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vr_slow, smi_profile_setting_larb1_vr_slow, smi_profile_setting_larb2_vr_slow,
+	 smi_profile_setting_larb3_vr_slow, smi_profile_setting_larb4_vr_slow, smi_profile_setting_larb5_vr_slow,
+	 smi_profile_setting_larb6_vr_slow}
+};
+
+/* N3D */
+#define SMI_PROFILE_SETTING_COMMON_N3D_NUM SMI_LARB_NR
+
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_n3d[SMI_PROFILE_SETTING_COMMON_N3D_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x13EC}, {REG_OFFSET_SMI_L1ARB1, 0x1000}, {REG_OFFSET_SMI_L1ARB2, 0x104B},
+	{REG_OFFSET_SMI_L1ARB3, 0x113D}, {REG_OFFSET_SMI_L1ARB4, 0x1000}, {REG_OFFSET_SMI_L1ARB5, 0x1000},
+	{REG_OFFSET_SMI_L1ARB6, 0x1654}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_n3d[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0x1f}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 1}, {0x214, 2}, {0x218, 3},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_n3d[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_n3d[SMI_LARB2_PORT_NUM] = {
+	{0x200, 1}, {0x204, 4}, {0x208, 2}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_n3d[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 3}, {0x234, 1}, {0x238, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb4_n3d[SMI_LARB4_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb5_n3d[SMI_LARB5_PORT_NUM] = {
+	{0x200, 6}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 6}, {0x214, 6}, {0x218, 6}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb6_n3d[SMI_LARB6_PORT_NUM] = {
+	{0x200, 7}, {0x204, 2}, {0x208, 7}, {0x20c, 0xa}, {0x210, 2}, {0x214, 1}, {0x218, 3}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+struct SMI_SETTING n3d_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_N3D_NUM, smi_profile_setting_common_n3d,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_n3d, smi_profile_setting_larb1_n3d, smi_profile_setting_larb2_n3d,
+	 smi_profile_setting_larb3_n3d, smi_profile_setting_larb4_n3d, smi_profile_setting_larb5_n3d,
+	 smi_profile_setting_larb6_n3d}
+};
+
+/* ICFP */
+#define SMI_PROFILE_SETTING_COMMON_ICFP_NUM SMI_LARB_NR
+
+struct SMI_SETTING_VALUE smi_profile_setting_common_icfp[SMI_PROFILE_SETTING_COMMON_ICFP_NUM] = {
+	{REG_OFFSET_SMI_L1ARB0, 0x146F}, {REG_OFFSET_SMI_L1ARB1, 0x1000}, {REG_OFFSET_SMI_L1ARB2, 0x1252},
+	{REG_OFFSET_SMI_L1ARB3, 0x1119}, {REG_OFFSET_SMI_L1ARB4, 0x1000}, {REG_OFFSET_SMI_L1ARB5, 0x1000},
+	{REG_OFFSET_SMI_L1ARB6, 0x1278}
+};
+
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb0_icfp[SMI_LARB0_PORT_NUM] = {
+	{0x200, 0x1f}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 1}, {0x214, 4}, {0x218, 3},
+	    {0x21c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb1_icfp[SMI_LARB1_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb2_icfp[SMI_LARB2_PORT_NUM] = {
+	{0x200, 0xa}, {0x204, 6}, {0x208, 2}, {0x20c, 1}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb3_icfp[SMI_LARB3_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}, {0x210, 1}, {0x214, 4}, {0x218, 2}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}, {0x228, 1}, {0x22c, 1}, {0x230, 1}, {0x234, 1}, {0x238, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb4_icfp[SMI_LARB4_PORT_NUM] = {
+	{0x200, 1}, {0x204, 1}, {0x208, 1}, {0x20c, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb5_icfp[SMI_LARB5_PORT_NUM] = {
+	{0x200, 6}, {0x204, 6}, {0x208, 0x1f}, {0x20c, 1}, {0x210, 6}, {0x214, 6}, {0x218, 6}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+
+struct SMI_SETTING_VALUE smi_profile_setting_larb6_icfp[SMI_LARB6_PORT_NUM] = {
+	{0x200, 7}, {0x204, 1}, {0x208, 2}, {0x20c, 2}, {0x210, 1}, {0x214, 1}, {0x218, 1}, {0x21c,
+											     1},
+	{0x220, 1}, {0x224, 1}
+};
+struct SMI_SETTING icfp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_ICFP_NUM, smi_profile_setting_common_icfp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_icfp, smi_profile_setting_larb1_icfp, smi_profile_setting_larb2_icfp,
+	 smi_profile_setting_larb3_icfp, smi_profile_setting_larb4_icfp, smi_profile_setting_larb5_icfp,
+	 smi_profile_setting_larb6_icfp}
+};
+
+/* vr series */
+struct SMI_SETTING vss_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr, smi_profile_setting_larb4_vr, smi_profile_setting_larb5_vr,
+	 smi_profile_setting_larb6_vr}
+};
+
+struct SMI_SETTING venc_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr, smi_profile_setting_larb4_vr, smi_profile_setting_larb5_vr,
+	 smi_profile_setting_larb6_vr}
+};
+
+/* vp series */
+struct SMI_SETTING vpwfd_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VR_NUM, smi_profile_setting_common_vr,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vr, smi_profile_setting_larb1_vr, smi_profile_setting_larb2_vr,
+	 smi_profile_setting_larb3_vr, smi_profile_setting_larb4_vr, smi_profile_setting_larb5_vr,
+	 smi_profile_setting_larb6_vr}
+};
+
+struct SMI_SETTING swdec_vp_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_VP_NUM, smi_profile_setting_common_vp,
+	{SMI_LARB0_PORT_NUM, SMI_LARB1_PORT_NUM, SMI_LARB2_PORT_NUM, SMI_LARB3_PORT_NUM,
+		SMI_LARB4_PORT_NUM, SMI_LARB5_PORT_NUM, SMI_LARB6_PORT_NUM},
+	{smi_profile_setting_larb0_vp, smi_profile_setting_larb1_vp, smi_profile_setting_larb2_vp,
+	 smi_profile_setting_larb3_vp, smi_profile_setting_larb4_vp, smi_profile_setting_larb5_vp,
+	 smi_profile_setting_larb6_vp}
+};
+
+/* init seris */
+struct SMI_SETTING mm_gpu_setting_config = {
+	SMI_PROFILE_SETTING_COMMON_INIT_NUM, smi_profile_setting_common_init,
+	{SMI_INITSETTING_LARB0_NUM, SMI_INITSETTING_LARB1_NUM, SMI_INITSETTING_LARB2_NUM, SMI_INITSETTING_LARB3_NUM,
+		SMI_INITSETTING_LARB4_NUM, SMI_INITSETTING_LARB5_NUM, SMI_INITSETTING_LARB6_NUM},
+	{smi_profile_setting_larb0_init, smi_profile_setting_larb1_init,
+	 smi_profile_setting_larb2_init, smi_profile_setting_larb3_init,
+	 smi_profile_setting_larb4_init, smi_profile_setting_larb5_init,
+	 smi_profile_setting_larb6_init}
+};
+
+struct SMI_SETTING ui_idle_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi4k_setting_config = { 0, NULL, {0}, {0} };
+
+#elif defined(SMI_BRINGUP)
+struct SMI_SETTING init_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vr_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING swdec_vp_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vp_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vr_slow_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING mm_gpu_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpwfd_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING venc_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING icfp_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vss_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING vpmjc_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING n3d_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING ui_idle_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi_setting_config = { 0, NULL, {0}, {0} };
+struct SMI_SETTING hdmi4k_setting_config = { 0, NULL, {0}, {0} };
+#endif
+
+struct SMI_PROFILE_CONFIG smi_profile_config[SMI_PROFILE_CONFIG_NUM] = {
+	{SMI_BWC_SCEN_NORMAL, &init_setting_config},
+	{SMI_BWC_SCEN_VR, &vr_setting_config},
+	{SMI_BWC_SCEN_SWDEC_VP, &swdec_vp_setting_config},
+	{SMI_BWC_SCEN_VP, &vp_setting_config},
+	{SMI_BWC_SCEN_VP_HIGH_FPS, &vp_setting_config},
+	{SMI_BWC_SCEN_VP_HIGH_RESOLUTION, &vp_setting_config},
+	{SMI_BWC_SCEN_VR_SLOW, &vr_slow_setting_config},
+	{SMI_BWC_SCEN_MM_GPU, &mm_gpu_setting_config},
+	{SMI_BWC_SCEN_WFD, &vpwfd_setting_config},
+	{SMI_BWC_SCEN_VENC, &venc_setting_config},
+	{SMI_BWC_SCEN_ICFP, &icfp_setting_config},
+	{SMI_BWC_SCEN_UI_IDLE, &ui_idle_setting_config},
+	{SMI_BWC_SCEN_VSS, &vss_setting_config},
+	{SMI_BWC_SCEN_FORCE_MMDVFS, &init_setting_config},
+	{SMI_BWC_SCEN_HDMI, &hdmi_setting_config},
+	{SMI_BWC_SCEN_HDMI4K, &hdmi4k_setting_config},
+	{SMI_BWC_SCEN_VPMJC, &vpmjc_setting_config},
+	{SMI_BWC_SCEN_N3D, &n3d_setting_config}
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /******************************************************************************
+ **
+ ** Copyright(c) 2009-2012  Realtek Corporation.
+ **
+ ** This program is free software; you can redistribute it and/or modify it
+ ** under the terms of version 2 of the GNU General Public License as
+ ** published by the Free Software Foundation.
+ **
+ ** This program is distributed in the hope that it will be useful, but WITHOUT
+ ** ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ ** FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ ** more details.
+ **
+ ** The full GNU General Public License is included in this distribution in the
+ ** file called LICENSE.
+ **
+ ** Contact Information:
+ ** wlanfae <wlanfae@realtek.com>
+ ** Realtek Corporation, No. 2, Innovation Road II, Hsinchu Science Park,
+ ** Hsinchu 300, Taiwan.
+ ** Larry Finger <Larry.Finger@lwfinger.net>
+ **
+ ******************************************************************************/
+
+#ifndef __RTL8723E_BTC_H__
+#define __RTL8723E_BTC_H__
+
+#include "../wifi.h"
+#include "hal_bt_coexist.h"
+
+struct bt_coexist_c2h_info {
+	u8 no_parse_c2h;
+	u8 has_c2h;
+};
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
