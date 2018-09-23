@@ -1,0 +1,3403 @@
+break;
+      }
+#if 0
+      case ATM_ABR: {
+	pcr = atm_pcr_goal (rxtp);
+	PRINTD (DBG_QOS, "pcr goal = %d", pcr);
+	break;
+      }
+#endif
+      default: {
+	// PRINTD (DBG_QOS, "request for non-UBR/ABR denied");
+	PRINTD (DBG_QOS, "request for non-UBR denied");
+	return -EINVAL;
+      }
+    }
+  }
+  
+  // get space for our vcc stuff
+  vcc = kmalloc (sizeof(amb_vcc), GFP_KERNEL);
+  if (!vcc) {
+    PRINTK (KERN_ERR, "out of memory!");
+    return -ENOMEM;
+  }
+  atm_vcc->dev_data = (void *) vcc;
+  
+  // no failures beyond this point
+  
+  // we are not really "immediately before allocating the connection
+  // identifier in hardware", but it will just have to do!
+  set_bit(ATM_VF_ADDR,&atm_vcc->flags);
+  
+  if (txtp->traffic_class != ATM_NONE) {
+    command cmd;
+    
+    vcc->tx_frame_bits = tx_frame_bits;
+    
+    mutex_lock(&dev->vcc_sf);
+    if (dev->rxer[vci]) {
+      // RXer on the channel already, just modify rate...
+      cmd.request = cpu_to_be32 (SRB_MODIFY_VC_RATE);
+      cmd.args.modify_rate.vc = cpu_to_be32 (vci);  // vpi 0
+      cmd.args.modify_rate.rate = cpu_to_be32 (tx_rate_bits << SRB_RATE_SHIFT);
+      while (command_do (dev, &cmd))
+	schedule();
+      // ... and TX flags, preserving the RX pool
+      cmd.request = cpu_to_be32 (SRB_MODIFY_VC_FLAGS);
+      cmd.args.modify_flags.vc = cpu_to_be32 (vci);  // vpi 0
+      cmd.args.modify_flags.flags = cpu_to_be32
+	( (AMB_VCC(dev->rxer[vci])->rx_info.pool << SRB_POOL_SHIFT)
+	  | (tx_vc_bits << SRB_FLAGS_SHIFT) );
+      while (command_do (dev, &cmd))
+	schedule();
+    } else {
+      // no RXer on the channel, just open (with pool zero)
+      cmd.request = cpu_to_be32 (SRB_OPEN_VC);
+      cmd.args.open.vc = cpu_to_be32 (vci);  // vpi 0
+      cmd.args.open.flags = cpu_to_be32 (tx_vc_bits << SRB_FLAGS_SHIFT);
+      cmd.args.open.rate = cpu_to_be32 (tx_rate_bits << SRB_RATE_SHIFT);
+      while (command_do (dev, &cmd))
+	schedule();
+    }
+    dev->txer[vci].tx_present = 1;
+    mutex_unlock(&dev->vcc_sf);
+  }
+  
+  if (rxtp->traffic_class != ATM_NONE) {
+    command cmd;
+    
+    vcc->rx_info.pool = pool;
+    
+    mutex_lock(&dev->vcc_sf);
+    /* grow RX buffer pool */
+    if (!dev->rxq[pool].buffers_wanted)
+      dev->rxq[pool].buffers_wanted = rx_lats;
+    dev->rxq[pool].buffers_wanted += 1;
+    fill_rx_pool (dev, pool, GFP_KERNEL);
+    
+    if (dev->txer[vci].tx_present) {
+      // TXer on the channel already
+      // switch (from pool zero) to this pool, preserving the TX bits
+      cmd.request = cpu_to_be32 (SRB_MODIFY_VC_FLAGS);
+      cmd.args.modify_flags.vc = cpu_to_be32 (vci);  // vpi 0
+      cmd.args.modify_flags.flags = cpu_to_be32
+	( (pool << SRB_POOL_SHIFT)
+	  | (dev->txer[vci].tx_vc_bits << SRB_FLAGS_SHIFT) );
+    } else {
+      // no TXer on the channel, open the VC (with no rate info)
+      cmd.request = cpu_to_be32 (SRB_OPEN_VC);
+      cmd.args.open.vc = cpu_to_be32 (vci);  // vpi 0
+      cmd.args.open.flags = cpu_to_be32 (pool << SRB_POOL_SHIFT);
+      cmd.args.open.rate = cpu_to_be32 (0);
+    }
+    while (command_do (dev, &cmd))
+      schedule();
+    // this link allows RX frames through
+    dev->rxer[vci] = atm_vcc;
+    mutex_unlock(&dev->vcc_sf);
+  }
+  
+  // indicate readiness
+  set_bit(ATM_VF_READY,&atm_vcc->flags);
+  
+  return 0;
+}
+
+/********** Close a VC **********/
+
+static void amb_close (struct atm_vcc * atm_vcc) {
+  amb_dev * dev = AMB_DEV (atm_vcc->dev);
+  amb_vcc * vcc = AMB_VCC (atm_vcc);
+  u16 vci = atm_vcc->vci;
+  
+  PRINTD (DBG_VCC|DBG_FLOW, "amb_close");
+  
+  // indicate unreadiness
+  clear_bit(ATM_VF_READY,&atm_vcc->flags);
+  
+  // disable TXing
+  if (atm_vcc->qos.txtp.traffic_class != ATM_NONE) {
+    command cmd;
+    
+    mutex_lock(&dev->vcc_sf);
+    if (dev->rxer[vci]) {
+      // RXer still on the channel, just modify rate... XXX not really needed
+      cmd.request = cpu_to_be32 (SRB_MODIFY_VC_RATE);
+      cmd.args.modify_rate.vc = cpu_to_be32 (vci);  // vpi 0
+      cmd.args.modify_rate.rate = cpu_to_be32 (0);
+      // ... and clear TX rate flags (XXX to stop RM cell output?), preserving RX pool
+    } else {
+      // no RXer on the channel, close channel
+      cmd.request = cpu_to_be32 (SRB_CLOSE_VC);
+      cmd.args.close.vc = cpu_to_be32 (vci); // vpi 0
+    }
+    dev->txer[vci].tx_present = 0;
+    while (command_do (dev, &cmd))
+      schedule();
+    mutex_unlock(&dev->vcc_sf);
+  }
+  
+  // disable RXing
+  if (atm_vcc->qos.rxtp.traffic_class != ATM_NONE) {
+    command cmd;
+    
+    // this is (the?) one reason why we need the amb_vcc struct
+    unsigned char pool = vcc->rx_info.pool;
+    
+    mutex_lock(&dev->vcc_sf);
+    if (dev->txer[vci].tx_present) {
+      // TXer still on the channel, just go to pool zero XXX not really needed
+      cmd.request = cpu_to_be32 (SRB_MODIFY_VC_FLAGS);
+      cmd.args.modify_flags.vc = cpu_to_be32 (vci);  // vpi 0
+      cmd.args.modify_flags.flags = cpu_to_be32
+	(dev->txer[vci].tx_vc_bits << SRB_FLAGS_SHIFT);
+    } else {
+      // no TXer on the channel, close the VC
+      cmd.request = cpu_to_be32 (SRB_CLOSE_VC);
+      cmd.args.close.vc = cpu_to_be32 (vci); // vpi 0
+    }
+    // forget the rxer - no more skbs will be pushed
+    if (atm_vcc != dev->rxer[vci])
+      PRINTK (KERN_ERR, "%s vcc=%p rxer[vci]=%p",
+	      "arghhh! we're going to die!",
+	      vcc, dev->rxer[vci]);
+    dev->rxer[vci] = NULL;
+    while (command_do (dev, &cmd))
+      schedule();
+    
+    /* shrink RX buffer pool */
+    dev->rxq[pool].buffers_wanted -= 1;
+    if (dev->rxq[pool].buffers_wanted == rx_lats) {
+      dev->rxq[pool].buffers_wanted = 0;
+      drain_rx_pool (dev, pool);
+    }
+    mutex_unlock(&dev->vcc_sf);
+  }
+  
+  // free our structure
+  kfree (vcc);
+  
+  // say the VPI/VCI is free again
+  clear_bit(ATM_VF_ADDR,&atm_vcc->flags);
+
+  return;
+}
+
+/********** Send **********/
+
+static int amb_send (struct atm_vcc * atm_vcc, struct sk_buff * skb) {
+  amb_dev * dev = AMB_DEV(atm_vcc->dev);
+  amb_vcc * vcc = AMB_VCC(atm_vcc);
+  u16 vc = atm_vcc->vci;
+  unsigned int tx_len = skb->len;
+  unsigned char * tx_data = skb->data;
+  tx_simple * tx_descr;
+  tx_in tx;
+  
+  if (test_bit (dead, &dev->flags))
+    return -EIO;
+  
+  PRINTD (DBG_FLOW|DBG_TX, "amb_send vc %x data %p len %u",
+	  vc, tx_data, tx_len);
+  
+  dump_skb (">>>", vc, skb);
+  
+  if (!dev->txer[vc].tx_present) {
+    PRINTK (KERN_ERR, "attempt to send on RX-only VC %x", vc);
+    return -EBADFD;
+  }
+  
+  // this is a driver private field so we have to set it ourselves,
+  // despite the fact that we are _required_ to use it to check for a
+  // pop function
+  ATM_SKB(skb)->vcc = atm_vcc;
+  
+  if (skb->len > (size_t) atm_vcc->qos.txtp.max_sdu) {
+    PRINTK (KERN_ERR, "sk_buff length greater than agreed max_sdu, dropping...");
+    return -EIO;
+  }
+  
+  if (check_area (skb->data, skb->len)) {
+    atomic_inc(&atm_vcc->stats->tx_err);
+    return -ENOMEM; // ?
+  }
+  
+  // allocate memory for fragments
+  tx_descr = kmalloc (sizeof(tx_simple), GFP_KERNEL);
+  if (!tx_descr) {
+    PRINTK (KERN_ERR, "could not allocate TX descriptor");
+    return -ENOMEM;
+  }
+  if (check_area (tx_descr, sizeof(tx_simple))) {
+    kfree (tx_descr);
+    return -ENOMEM;
+  }
+  PRINTD (DBG_TX, "fragment list allocated at %p", tx_descr);
+  
+  tx_descr->skb = skb;
+  
+  tx_descr->tx_frag.bytes = cpu_to_be32 (tx_len);
+  tx_descr->tx_frag.address = cpu_to_be32 (virt_to_bus (tx_data));
+  
+  tx_descr->tx_frag_end.handle = virt_to_bus (tx_descr);
+  tx_descr->tx_frag_end.vc = 0;
+  tx_descr->tx_frag_end.next_descriptor_length = 0;
+  tx_descr->tx_frag_end.next_descriptor = 0;
+#ifdef AMB_NEW_MICROCODE
+  tx_descr->tx_frag_end.cpcs_uu = 0;
+  tx_descr->tx_frag_end.cpi = 0;
+  tx_descr->tx_frag_end.pad = 0;
+#endif
+  
+  tx.vc = cpu_to_be16 (vcc->tx_frame_bits | vc);
+  tx.tx_descr_length = cpu_to_be16 (sizeof(tx_frag)+sizeof(tx_frag_end));
+  tx.tx_descr_addr = cpu_to_be32 (virt_to_bus (&tx_descr->tx_frag));
+  
+  while (tx_give (dev, &tx))
+    schedule();
+  return 0;
+}
+
+/********** Change QoS on a VC **********/
+
+// int amb_change_qos (struct atm_vcc * atm_vcc, struct atm_qos * qos, int flags);
+
+/********** Free RX Socket Buffer **********/
+
+#if 0
+static void amb_free_rx_skb (struct atm_vcc * atm_vcc, struct sk_buff * skb) {
+  amb_dev * dev = AMB_DEV (atm_vcc->dev);
+  amb_vcc * vcc = AMB_VCC (atm_vcc);
+  unsigned char pool = vcc->rx_info.pool;
+  rx_in rx;
+  
+  // This may be unsafe for various reasons that I cannot really guess
+  // at. However, I note that the ATM layer calls kfree_skb rather
+  // than dev_kfree_skb at this point so we are least covered as far
+  // as buffer locking goes. There may be bugs if pcap clones RX skbs.
+
+  PRINTD (DBG_FLOW|DBG_SKB, "amb_rx_free skb %p (atm_vcc %p, vcc %p)",
+	  skb, atm_vcc, vcc);
+  
+  rx.handle = virt_to_bus (skb);
+  rx.host_address = cpu_to_be32 (virt_to_bus (skb->data));
+  
+  skb->data = skb->head;
+  skb_reset_tail_pointer(skb);
+  skb->len = 0;
+  
+  if (!rx_give (dev, &rx, pool)) {
+    // success
+    PRINTD (DBG_SKB|DBG_POOL, "recycled skb for pool %hu", pool);
+    return;
+  }
+  
+  // just do what the ATM layer would have done
+  dev_kfree_skb_any (skb);
+  
+  return;
+}
+#endif
+
+/********** Proc File Output **********/
+
+static int amb_proc_read (struct atm_dev * atm_dev, loff_t * pos, char * page) {
+  amb_dev * dev = AMB_DEV (atm_dev);
+  int left = *pos;
+  unsigned char pool;
+  
+  PRINTD (DBG_FLOW, "amb_proc_read");
+  
+  /* more diagnostics here? */
+  
+  if (!left--) {
+    amb_stats * s = &dev->stats;
+    return sprintf (page,
+		    "frames: TX OK %lu, RX OK %lu, RX bad %lu "
+		    "(CRC %lu, long %lu, aborted %lu, unused %lu).\n",
+		    s->tx_ok, s->rx.ok, s->rx.error,
+		    s->rx.badcrc, s->rx.toolong,
+		    s->rx.aborted, s->rx.unused);
+  }
+  
+  if (!left--) {
+    amb_cq * c = &dev->cq;
+    return sprintf (page, "cmd queue [cur/hi/max]: %u/%u/%u. ",
+		    c->pending, c->high, c->maximum);
+  }
+  
+  if (!left--) {
+    amb_txq * t = &dev->txq;
+    return sprintf (page, "TX queue [cur/max high full]: %u/%u %u %u.\n",
+		    t->pending, t->maximum, t->high, t->filled);
+  }
+  
+  if (!left--) {
+    unsigned int count = sprintf (page, "RX queues [cur/max/req low empty]:");
+    for (pool = 0; pool < NUM_RX_POOLS; ++pool) {
+      amb_rxq * r = &dev->rxq[pool];
+      count += sprintf (page+count, " %u/%u/%u %u %u",
+			r->pending, r->maximum, r->buffers_wanted, r->low, r->emptied);
+    }
+    count += sprintf (page+count, ".\n");
+    return count;
+  }
+  
+  if (!left--) {
+    unsigned int count = sprintf (page, "RX buffer sizes:");
+    for (pool = 0; pool < NUM_RX_POOLS; ++pool) {
+      amb_rxq * r = &dev->rxq[pool];
+      count += sprintf (page+count, " %u", r->buffer_size);
+    }
+    count += sprintf (page+count, ".\n");
+    return count;
+  }
+  
+#if 0
+  if (!left--) {
+    // suni block etc?
+  }
+#endif
+  
+  return 0;
+}
+
+/********** Operation Structure **********/
+
+static const struct atmdev_ops amb_ops = {
+  .open         = amb_open,
+  .close	= amb_close,
+  .send         = amb_send,
+  .proc_read	= amb_proc_read,
+  .owner	= THIS_MODULE,
+};
+
+/********** housekeeping **********/
+static void do_housekeeping (unsigned long arg) {
+  amb_dev * dev = (amb_dev *) arg;
+  
+  // could collect device-specific (not driver/atm-linux) stats here
+      
+  // last resort refill once every ten seconds
+  fill_rx_pools (dev);
+  mod_timer(&dev->housekeeping, jiffies + 10*HZ);
+  
+  return;
+}
+
+/********** creation of communication queues **********/
+
+static int create_queues(amb_dev *dev, unsigned int cmds, unsigned int txs,
+			 unsigned int *rxs, unsigned int *rx_buffer_sizes)
+{
+  unsigned char pool;
+  size_t total = 0;
+  void * memory;
+  void * limit;
+  
+  PRINTD (DBG_FLOW, "create_queues %p", dev);
+  
+  total += cmds * sizeof(command);
+  
+  total += txs * (sizeof(tx_in) + sizeof(tx_out));
+  
+  for (pool = 0; pool < NUM_RX_POOLS; ++pool)
+    total += rxs[pool] * (sizeof(rx_in) + sizeof(rx_out));
+  
+  memory = kmalloc (total, GFP_KERNEL);
+  if (!memory) {
+    PRINTK (KERN_ERR, "could not allocate queues");
+    return -ENOMEM;
+  }
+  if (check_area (memory, total)) {
+    PRINTK (KERN_ERR, "queues allocated in nasty area");
+    kfree (memory);
+    return -ENOMEM;
+  }
+  
+  limit = memory + total;
+  PRINTD (DBG_INIT, "queues from %p to %p", memory, limit);
+  
+  PRINTD (DBG_CMD, "command queue at %p", memory);
+  
+  {
+    command * cmd = memory;
+    amb_cq * cq = &dev->cq;
+    
+    cq->pending = 0;
+    cq->high = 0;
+    cq->maximum = cmds - 1;
+    
+    cq->ptrs.start = cmd;
+    cq->ptrs.in = cmd;
+    cq->ptrs.out = cmd;
+    cq->ptrs.limit = cmd + cmds;
+    
+    memory = cq->ptrs.limit;
+  }
+  
+  PRINTD (DBG_TX, "TX queue pair at %p", memory);
+  
+  {
+    tx_in * in = memory;
+    tx_out * out;
+    amb_txq * txq = &dev->txq;
+    
+    txq->pending = 0;
+    txq->high = 0;
+    txq->filled = 0;
+    txq->maximum = txs - 1;
+    
+    txq->in.start = in;
+    txq->in.ptr = in;
+    txq->in.limit = in + txs;
+    
+    memory = txq->in.limit;
+    out = memory;
+    
+    txq->out.start = out;
+    txq->out.ptr = out;
+    txq->out.limit = out + txs;
+    
+    memory = txq->out.limit;
+  }
+  
+  PRINTD (DBG_RX, "RX queue pairs at %p", memory);
+  
+  for (pool = 0; pool < NUM_RX_POOLS; ++pool) {
+    rx_in * in = memory;
+    rx_out * out;
+    amb_rxq * rxq = &dev->rxq[pool];
+    
+    rxq->buffer_size = rx_buffer_sizes[pool];
+    rxq->buffers_wanted = 0;
+    
+    rxq->pending = 0;
+    rxq->low = rxs[pool] - 1;
+    rxq->emptied = 0;
+    rxq->maximum = rxs[pool] - 1;
+    
+    rxq->in.start = in;
+    rxq->in.ptr = in;
+    rxq->in.limit = in + rxs[pool];
+    
+    memory = rxq->in.limit;
+    out = memory;
+    
+    rxq->out.start = out;
+    rxq->out.ptr = out;
+    rxq->out.limit = out + rxs[pool];
+    
+    memory = rxq->out.limit;
+  }
+  
+  if (memory == limit) {
+    return 0;
+  } else {
+    PRINTK (KERN_ERR, "bad queue alloc %p != %p (tell maintainer)", memory, limit);
+    kfree (limit - total);
+    return -ENOMEM;
+  }
+  
+}
+
+/********** destruction of communication queues **********/
+
+static void destroy_queues (amb_dev * dev) {
+  // all queues assumed empty
+  void * memory = dev->cq.ptrs.start;
+  // includes txq.in, txq.out, rxq[].in and rxq[].out
+  
+  PRINTD (DBG_FLOW, "destroy_queues %p", dev);
+  
+  PRINTD (DBG_INIT, "freeing queues at %p", memory);
+  kfree (memory);
+  
+  return;
+}
+
+/********** basic loader commands and error handling **********/
+// centisecond timeouts - guessing away here
+static unsigned int command_timeouts [] = {
+	[host_memory_test]     = 15,
+	[read_adapter_memory]  = 2,
+	[write_adapter_memory] = 2,
+	[adapter_start]        = 50,
+	[get_version_number]   = 10,
+	[interrupt_host]       = 1,
+	[flash_erase_sector]   = 1,
+	[adap_download_block]  = 1,
+	[adap_erase_flash]     = 1,
+	[adap_run_in_iram]     = 1,
+	[adap_end_download]    = 1
+};
+
+
+static unsigned int command_successes [] = {
+	[host_memory_test]     = COMMAND_PASSED_TEST,
+	[read_adapter_memory]  = COMMAND_READ_DATA_OK,
+	[write_adapter_memory] = COMMAND_WRITE_DATA_OK,
+	[adapter_start]        = COMMAND_COMPLETE,
+	[get_version_number]   = COMMAND_COMPLETE,
+	[interrupt_host]       = COMMAND_COMPLETE,
+	[flash_erase_sector]   = COMMAND_COMPLETE,
+	[adap_download_block]  = COMMAND_COMPLETE,
+	[adap_erase_flash]     = COMMAND_COMPLETE,
+	[adap_run_in_iram]     = COMMAND_COMPLETE,
+	[adap_end_download]    = COMMAND_COMPLETE
+};
+  
+static  int decode_loader_result (loader_command cmd, u32 result)
+{
+	int res;
+	const char *msg;
+
+	if (result == command_successes[cmd])
+		return 0;
+
+	switch (result) {
+		case BAD_COMMAND:
+			res = -EINVAL;
+			msg = "bad command";
+			break;
+		case COMMAND_IN_PROGRESS:
+			res = -ETIMEDOUT;
+			msg = "command in progress";
+			break;
+		case COMMAND_PASSED_TEST:
+			res = 0;
+			msg = "command passed test";
+			break;
+		case COMMAND_FAILED_TEST:
+			res = -EIO;
+			msg = "command failed test";
+			break;
+		case COMMAND_READ_DATA_OK:
+			res = 0;
+			msg = "command read data ok";
+			break;
+		case COMMAND_READ_BAD_ADDRESS:
+			res = -EINVAL;
+			msg = "command read bad address";
+			break;
+		case COMMAND_WRITE_DATA_OK:
+			res = 0;
+			msg = "command write data ok";
+			break;
+		case COMMAND_WRITE_BAD_ADDRESS:
+			res = -EINVAL;
+			msg = "command write bad address";
+			break;
+		case COMMAND_WRITE_FLASH_FAILURE:
+			res = -EIO;
+			msg = "command write flash failure";
+			break;
+		case COMMAND_COMPLETE:
+			res = 0;
+			msg = "command complete";
+			break;
+		case COMMAND_FLASH_ERASE_FAILURE:
+			res = -EIO;
+			msg = "command flash erase failure";
+			break;
+		case COMMAND_WRITE_BAD_DATA:
+			res = -EINVAL;
+			msg = "command write bad data";
+			break;
+		default:
+			res = -EINVAL;
+			msg = "unknown error";
+			PRINTD (DBG_LOAD|DBG_ERR,
+				"decode_loader_result got %d=%x !",
+				result, result);
+			break;
+	}
+
+	PRINTK (KERN_ERR, "%s", msg);
+	return res;
+}
+
+static int do_loader_command(volatile loader_block *lb, const amb_dev *dev,
+			     loader_command cmd)
+{
+  
+  unsigned long timeout;
+  
+  PRINTD (DBG_FLOW|DBG_LOAD, "do_loader_command");
+  
+  /* do a command
+     
+     Set the return value to zero, set the command type and set the
+     valid entry to the right magic value. The payload is already
+     correctly byte-ordered so we leave it alone. Hit the doorbell
+     with the bus address of this structure.
+     
+  */
+  
+  lb->result = 0;
+  lb->command = cpu_to_be32 (cmd);
+  lb->valid = cpu_to_be32 (DMA_VALID);
+  // dump_registers (dev);
+  // dump_loader_block (lb);
+  wr_mem (dev, offsetof(amb_mem, doorbell), virt_to_bus (lb) & ~onegigmask);
+  
+  timeout = command_timeouts[cmd] * 10;
+  
+  while (!lb->result || lb->result == cpu_to_be32 (COMMAND_IN_PROGRESS))
+    if (timeout) {
+      timeout = msleep_interruptible(timeout);
+    } else {
+      PRINTD (DBG_LOAD|DBG_ERR, "command %d timed out", cmd);
+      dump_registers (dev);
+      dump_loader_block (lb);
+      return -ETIMEDOUT;
+    }
+  
+  if (cmd == adapter_start) {
+    // wait for start command to acknowledge...
+    timeout = 100;
+    while (rd_plain (dev, offsetof(amb_mem, doorbell)))
+      if (timeout) {
+	timeout = msleep_interruptible(timeout);
+      } else {
+	PRINTD (DBG_LOAD|DBG_ERR, "start command did not clear doorbell, res=%08x",
+		be32_to_cpu (lb->result));
+	dump_registers (dev);
+	return -ETIMEDOUT;
+      }
+    return 0;
+  } else {
+    return decode_loader_result (cmd, be32_to_cpu (lb->result));
+  }
+  
+}
+
+/* loader: determine loader version */
+
+static int get_loader_version(loader_block *lb, const amb_dev *dev,
+			      u32 *version)
+{
+  int res;
+  
+  PRINTD (DBG_FLOW|DBG_LOAD, "get_loader_version");
+  
+  res = do_loader_command (lb, dev, get_version_number);
+  if (res)
+    return res;
+  if (version)
+    *version = be32_to_cpu (lb->payload.version);
+  return 0;
+}
+
+/* loader: write memory data blocks */
+
+static int loader_write(loader_block *lb, const amb_dev *dev,
+			const struct ihex_binrec *rec)
+{
+  transfer_block * tb = &lb->payload.transfer;
+  
+  PRINTD (DBG_FLOW|DBG_LOAD, "loader_write");
+
+  tb->address = rec->addr;
+  tb->count = cpu_to_be32(be16_to_cpu(rec->len) / 4);
+  memcpy(tb->data, rec->data, be16_to_cpu(rec->len));
+  return do_loader_command (lb, dev, write_adapter_memory);
+}
+
+/* loader: verify memory data blocks */
+
+static int loader_verify(loader_block *lb, const amb_dev *dev,
+			 const struct ihex_binrec *rec)
+{
+  transfer_block * tb = &lb->payload.transfer;
+  int res;
+  
+  PRINTD (DBG_FLOW|DBG_LOAD, "loader_verify");
+  
+  tb->address = rec->addr;
+  tb->count = cpu_to_be32(be16_to_cpu(rec->len) / 4);
+  res = do_loader_command (lb, dev, read_adapter_memory);
+  if (!res && memcmp(tb->data, rec->data, be16_to_cpu(rec->len)))
+    res = -EINVAL;
+  return res;
+}
+
+/* loader: start microcode */
+
+static int loader_start(loader_block *lb, const amb_dev *dev, u32 address)
+{
+  PRINTD (DBG_FLOW|DBG_LOAD, "loader_start");
+  
+  lb->payload.start = cpu_to_be32 (address);
+  return do_loader_command (lb, dev, adapter_start);
+}
+
+/********** reset card **********/
+
+static inline void sf (const char * msg)
+{
+	PRINTK (KERN_ERR, "self-test failed: %s", msg);
+}
+
+static int amb_reset (amb_dev * dev, int diags) {
+  u32 word;
+  
+  PRINTD (DBG_FLOW|DBG_LOAD, "amb_reset");
+  
+  word = rd_plain (dev, offsetof(amb_mem, reset_control));
+  // put card into reset state
+  wr_plain (dev, offsetof(amb_mem, reset_control), word | AMB_RESET_BITS);
+  // wait a short while
+  udelay (10);
+#if 1
+  // put card into known good state
+  wr_plain (dev, offsetof(amb_mem, interrupt_control), AMB_DOORBELL_BITS);
+  // clear all interrupts just in case
+  wr_plain (dev, offsetof(amb_mem, interrupt), -1);
+#endif
+  // clear self-test done flag
+  wr_plain (dev, offsetof(amb_mem, mb.loader.ready), 0);
+  // take card out of reset state
+  wr_plain (dev, offsetof(amb_mem, reset_control), word &~ AMB_RESET_BITS);
+  
+  if (diags) { 
+    unsigned long timeout;
+    // 4.2 second wait
+    msleep(4200);
+    // half second time-out
+    timeout = 500;
+    while (!rd_plain (dev, offsetof(amb_mem, mb.loader.ready)))
+      if (timeout) {
+	timeout = msleep_interruptible(timeout);
+      } else {
+	PRINTD (DBG_LOAD|DBG_ERR, "reset timed out");
+	return -ETIMEDOUT;
+      }
+    
+    // get results of self-test
+    // XXX double check byte-order
+    word = rd_mem (dev, offsetof(amb_mem, mb.loader.result));
+    if (word & SELF_TEST_FAILURE) {
+      if (word & GPINT_TST_FAILURE)
+	sf ("interrupt");
+      if (word & SUNI_DATA_PATTERN_FAILURE)
+	sf ("SUNI data pattern");
+      if (word & SUNI_DATA_BITS_FAILURE)
+	sf ("SUNI data bits");
+      if (word & SUNI_UTOPIA_FAILURE)
+	sf ("SUNI UTOPIA interface");
+      if (word & SUNI_FIFO_FAILURE)
+	sf ("SUNI cell buffer FIFO");
+      if (word & SRAM_FAILURE)
+	sf ("bad SRAM");
+      // better return value?
+      return -EIO;
+    }
+    
+  }
+  return 0;
+}
+
+/********** transfer and start the microcode **********/
+
+static int ucode_init(loader_block *lb, amb_dev *dev)
+{
+  const struct firmware *fw;
+  unsigned long start_address;
+  const struct ihex_binrec *rec;
+  const char *errmsg = NULL;
+  int res;
+
+  res = request_ihex_firmware(&fw, "atmsar11.fw", &dev->pci_dev->dev);
+  if (res) {
+    PRINTK (KERN_ERR, "Cannot load microcode data");
+    return res;
+  }
+
+  /* First record contains just the start address */
+  rec = (const struct ihex_binrec *)fw->data;
+  if (be16_to_cpu(rec->len) != sizeof(__be32) || be32_to_cpu(rec->addr)) {
+    errmsg = "no start record";
+    goto fail;
+  }
+  start_address = be32_to_cpup((__be32 *)rec->data);
+
+  rec = ihex_next_binrec(rec);
+
+  PRINTD (DBG_FLOW|DBG_LOAD, "ucode_init");
+
+  while (rec) {
+    PRINTD (DBG_LOAD, "starting region (%x, %u)", be32_to_cpu(rec->addr),
+	    be16_to_cpu(rec->len));
+    if (be16_to_cpu(rec->len) > 4 * MAX_TRANSFER_DATA) {
+	    errmsg = "record too long";
+	    goto fail;
+    }
+    if (be16_to_cpu(rec->len) & 3) {
+	    errmsg = "odd number of bytes";
+	    goto fail;
+    }
+    res = loader_write(lb, dev, rec);
+    if (res)
+      break;
+
+    res = loader_verify(lb, dev, rec);
+    if (res)
+      break;
+    rec = ihex_next_binrec(rec);
+  }
+  release_firmware(fw);
+  if (!res)
+    res = loader_start(lb, dev, start_address);
+
+  return res;
+fail:
+  release_firmware(fw);
+  PRINTK(KERN_ERR, "Bad microcode data (%s)", errmsg);
+  return -EINVAL;
+}
+
+/********** give adapter parameters **********/
+  
+static inline __be32 bus_addr(void * addr) {
+    return cpu_to_be32 (virt_to_bus (addr));
+}
+
+static int amb_talk(amb_dev *dev)
+{
+  adap_talk_block a;
+  unsigned char pool;
+  unsigned long timeout;
+  
+  PRINTD (DBG_FLOW, "amb_talk %p", dev);
+  
+  a.command_start = bus_addr (dev->cq.ptrs.start);
+  a.command_end   = bus_addr (dev->cq.ptrs.limit);
+  a.tx_start      = bus_addr (dev->txq.in.start);
+  a.tx_end        = bus_addr (dev->txq.in.limit);
+  a.txcom_start   = bus_addr (dev->txq.out.start);
+  a.txcom_end     = bus_addr (dev->txq.out.limit);
+  
+  for (pool = 0; pool < NUM_RX_POOLS; ++pool) {
+    // the other "a" items are set up by the adapter
+    a.rec_struct[pool].buffer_start = bus_addr (dev->rxq[pool].in.start);
+    a.rec_struct[pool].buffer_end   = bus_addr (dev->rxq[pool].in.limit);
+    a.rec_struct[pool].rx_start     = bus_addr (dev->rxq[pool].out.start);
+    a.rec_struct[pool].rx_end       = bus_addr (dev->rxq[pool].out.limit);
+    a.rec_struct[pool].buffer_size = cpu_to_be32 (dev->rxq[pool].buffer_size);
+  }
+  
+#ifdef AMB_NEW_MICROCODE
+  // disable fast PLX prefetching
+  a.init_flags = 0;
+#endif
+  
+  // pass the structure
+  wr_mem (dev, offsetof(amb_mem, doorbell), virt_to_bus (&a));
+  
+  // 2.2 second wait (must not touch doorbell during 2 second DMA test)
+  msleep(2200);
+  // give the adapter another half second?
+  timeout = 500;
+  while (rd_plain (dev, offsetof(amb_mem, doorbell)))
+    if (timeout) {
+      timeout = msleep_interruptible(timeout);
+    } else {
+      PRINTD (DBG_INIT|DBG_ERR, "adapter init timed out");
+      return -ETIMEDOUT;
+    }
+  
+  return 0;
+}
+
+// get microcode version
+static void amb_ucode_version(amb_dev *dev)
+{
+  u32 major;
+  u32 minor;
+  command cmd;
+  cmd.request = cpu_to_be32 (SRB_GET_VERSION);
+  while (command_do (dev, &cmd)) {
+    set_current_state(TASK_UNINTERRUPTIBLE);
+    schedule();
+  }
+  major = be32_to_cpu (cmd.args.version.major);
+  minor = be32_to_cpu (cmd.args.version.minor);
+  PRINTK (KERN_INFO, "microcode version is %u.%u", major, minor);
+}
+  
+// get end station address
+static void amb_esi(amb_dev *dev, u8 *esi)
+{
+  u32 lower4;
+  u16 upper2;
+  command cmd;
+  
+  cmd.request = cpu_to_be32 (SRB_GET_BIA);
+  while (command_do (dev, &cmd)) {
+    set_current_state(TASK_UNINTERRUPTIBLE);
+    schedule();
+  }
+  lower4 = be32_to_cpu (cmd.args.bia.lower4);
+  upper2 = be32_to_cpu (cmd.args.bia.upper2);
+  PRINTD (DBG_LOAD, "BIA: lower4: %08x, upper2 %04x", lower4, upper2);
+  
+  if (esi) {
+    unsigned int i;
+    
+    PRINTDB (DBG_INIT, "ESI:");
+    for (i = 0; i < ESI_LEN; ++i) {
+      if (i < 4)
+	  esi[i] = bitrev8(lower4>>(8*i));
+      else
+	  esi[i] = bitrev8(upper2>>(8*(i-4)));
+      PRINTDM (DBG_INIT, " %02x", esi[i]);
+    }
+    
+    PRINTDE (DBG_INIT, "");
+  }
+  
+  return;
+}
+  
+static void fixup_plx_window (amb_dev *dev, loader_block *lb)
+{
+	// fix up the PLX-mapped window base address to match the block
+	unsigned long blb;
+	u32 mapreg;
+	blb = virt_to_bus(lb);
+	// the kernel stack had better not ever cross a 1Gb boundary!
+	mapreg = rd_plain (dev, offsetof(amb_mem, stuff[10]));
+	mapreg &= ~onegigmask;
+	mapreg |= blb & onegigmask;
+	wr_plain (dev, offsetof(amb_mem, stuff[10]), mapreg);
+	return;
+}
+
+static int amb_init(amb_dev *dev)
+{
+  loader_block lb;
+  
+  u32 version;
+  
+  if (amb_reset (dev, 1)) {
+    PRINTK (KERN_ERR, "card reset failed!");
+  } else {
+    fixup_plx_window (dev, &lb);
+    
+    if (get_loader_version (&lb, dev, &version)) {
+      PRINTK (KERN_INFO, "failed to get loader version");
+    } else {
+      PRINTK (KERN_INFO, "loader version is %08x", version);
+      
+      if (ucode_init (&lb, dev)) {
+	PRINTK (KERN_ERR, "microcode failure");
+      } else if (create_queues (dev, cmds, txs, rxs, rxs_bs)) {
+	PRINTK (KERN_ERR, "failed to get memory for queues");
+      } else {
+	
+	if (amb_talk (dev)) {
+	  PRINTK (KERN_ERR, "adapter did not accept queues");
+	} else {
+	  
+	  amb_ucode_version (dev);
+	  return 0;
+	  
+	} /* amb_talk */
+	
+	destroy_queues (dev);
+      } /* create_queues, ucode_init */
+      
+      amb_reset (dev, 0);
+    } /* get_loader_version */
+    
+  } /* amb_reset */
+  
+  return -EINVAL;
+}
+
+static void setup_dev(amb_dev *dev, struct pci_dev *pci_dev) 
+{
+      unsigned char pool;
+      
+      // set up known dev items straight away
+      dev->pci_dev = pci_dev; 
+      pci_set_drvdata(pci_dev, dev);
+      
+      dev->iobase = pci_resource_start (pci_dev, 1);
+      dev->irq = pci_dev->irq; 
+      dev->membase = bus_to_virt(pci_resource_start(pci_dev, 0));
+      
+      // flags (currently only dead)
+      dev->flags = 0;
+      
+      // Allocate cell rates (fibre)
+      // ATM_OC3_PCR = 1555200000/8/270*260/53 - 29/53
+      // to be really pedantic, this should be ATM_OC3c_PCR
+      dev->tx_avail = ATM_OC3_PCR;
+      dev->rx_avail = ATM_OC3_PCR;
+      
+      // semaphore for txer/rxer modifications - we cannot use a
+      // spinlock as the critical region needs to switch processes
+      mutex_init(&dev->vcc_sf);
+      // queue manipulation spinlocks; we want atomic reads and
+      // writes to the queue descriptors (handles IRQ and SMP)
+      // consider replacing "int pending" -> "atomic_t available"
+      // => problem related to who gets to move queue pointers
+      spin_lock_init (&dev->cq.lock);
+      spin_lock_init (&dev->txq.lock);
+      for (pool = 0; pool < NUM_RX_POOLS; ++pool)
+	spin_lock_init (&dev->rxq[pool].lock);
+}
+
+static void setup_pci_dev(struct pci_dev *pci_dev)
+{
+	unsigned char lat;
+      
+	// enable bus master accesses
+	pci_set_master(pci_dev);
+
+	// frobnicate latency (upwards, usually)
+	pci_read_config_byte (pci_dev, PCI_LATENCY_TIMER, &lat);
+
+	if (!pci_lat)
+		pci_lat = (lat < MIN_PCI_LATENCY) ? MIN_PCI_LATENCY : lat;
+
+	if (lat != pci_lat) {
+		PRINTK (KERN_INFO, "Changing PCI latency timer from %hu to %hu",
+			lat, pci_lat);
+		pci_write_config_byte(pci_dev, PCI_LATENCY_TIMER, pci_lat);
+	}
+}
+
+static int amb_probe(struct pci_dev *pci_dev,
+		     const struct pci_device_id *pci_ent)
+{
+	amb_dev * dev;
+	int err;
+	unsigned int irq;
+      
+	err = pci_enable_device(pci_dev);
+	if (err < 0) {
+		PRINTK (KERN_ERR, "skipped broken (PLX rev 2) card");
+		goto out;
+	}
+
+	// read resources from PCI configuration space
+	irq = pci_dev->irq;
+
+	if (pci_dev->device == PCI_DEVICE_ID_MADGE_AMBASSADOR_BAD) {
+		PRINTK (KERN_ERR, "skipped broken (PLX rev 2) card");
+		err = -EINVAL;
+		goto out_disable;
+	}
+
+	PRINTD (DBG_INFO, "found Madge ATM adapter (amb) at"
+		" IO %llx, IRQ %u, MEM %p",
+		(unsigned long long)pci_resource_start(pci_dev, 1),
+		irq, bus_to_virt(pci_resource_start(pci_dev, 0)));
+
+	// check IO region
+	err = pci_request_region(pci_dev, 1, DEV_LABEL);
+	if (err < 0) {
+		PRINTK (KERN_ERR, "IO range already in use!");
+		goto out_disable;
+	}
+
+	dev = kzalloc(sizeof(amb_dev), GFP_KERNEL);
+	if (!dev) {
+		PRINTK (KERN_ERR, "out of memory!");
+		err = -ENOMEM;
+		goto out_release;
+	}
+
+	setup_dev(dev, pci_dev);
+
+	err = amb_init(dev);
+	if (err < 0) {
+		PRINTK (KERN_ERR, "adapter initialisation failure");
+		goto out_free;
+	}
+
+	setup_pci_dev(pci_dev);
+
+	// grab (but share) IRQ and install handler
+	err = request_irq(irq, interrupt_handler, IRQF_SHARED, DEV_LABEL, dev);
+	if (err < 0) {
+		PRINTK (KERN_ERR, "request IRQ failed!");
+		goto out_reset;
+	}
+
+	dev->atm_dev = atm_dev_register (DEV_LABEL, &pci_dev->dev, &amb_ops, -1,
+					 NULL);
+	if (!dev->atm_dev) {
+		PRINTD (DBG_ERR, "failed to register Madge ATM adapter");
+		err = -EINVAL;
+		goto out_free_irq;
+	}
+
+	PRINTD (DBG_INFO, "registered Madge ATM adapter (no. %d) (%p) at %p",
+		dev->atm_dev->number, dev, dev->atm_dev);
+		dev->atm_dev->dev_data = (void *) dev;
+
+	// register our address
+	amb_esi (dev, dev->atm_dev->esi);
+
+	// 0 bits for vpi, 10 bits for vci
+	dev->atm_dev->ci_range.vpi_bits = NUM_VPI_BITS;
+	dev->atm_dev->ci_range.vci_bits = NUM_VCI_BITS;
+
+	init_timer(&dev->housekeeping);
+	dev->housekeeping.function = do_housekeeping;
+	dev->housekeeping.data = (unsigned long) dev;
+	mod_timer(&dev->housekeeping, jiffies);
+
+	// enable host interrupts
+	interrupts_on (dev);
+
+out:
+	return err;
+
+out_free_irq:
+	free_irq(irq, dev);
+out_reset:
+	amb_reset(dev, 0);
+out_free:
+	kfree(dev);
+out_release:
+	pci_release_region(pci_dev, 1);
+out_disable:
+	pci_disable_device(pci_dev);
+	goto out;
+}
+
+
+static void amb_remove_one(struct pci_dev *pci_dev)
+{
+	struct amb_dev *dev;
+
+	dev = pci_get_drvdata(pci_dev);
+
+	PRINTD(DBG_INFO|DBG_INIT, "closing %p (atm_dev = %p)", dev, dev->atm_dev);
+	del_timer_sync(&dev->housekeeping);
+	// the drain should not be necessary
+	drain_rx_pools(dev);
+	interrupts_off(dev);
+	amb_reset(dev, 0);
+	free_irq(dev->irq, dev);
+	pci_disable_device(pci_dev);
+	destroy_queues(dev);
+	atm_dev_deregister(dev->atm_dev);
+	kfree(dev);
+	pci_release_region(pci_dev, 1);
+}
+
+static void __init amb_check_args (void) {
+  unsigned char pool;
+  unsigned int max_rx_size;
+  
+#ifdef DEBUG_AMBASSADOR
+  PRINTK (KERN_NOTICE, "debug bitmap is %hx", debug &= DBG_MASK);
+#else
+  if (debug)
+    PRINTK (KERN_NOTICE, "no debugging support");
+#endif
+  
+  if (cmds < MIN_QUEUE_SIZE)
+    PRINTK (KERN_NOTICE, "cmds has been raised to %u",
+	    cmds = MIN_QUEUE_SIZE);
+  
+  if (txs < MIN_QUEUE_SIZE)
+    PRINTK (KERN_NOTICE, "txs has been raised to %u",
+	    txs = MIN_QUEUE_SIZE);
+  
+  for (pool = 0; pool < NUM_RX_POOLS; ++pool)
+    if (rxs[pool] < MIN_QUEUE_SIZE)
+      PRINTK (KERN_NOTICE, "rxs[%hu] has been raised to %u",
+	      pool, rxs[pool] = MIN_QUEUE_SIZE);
+  
+  // buffers sizes should be greater than zero and strictly increasing
+  max_rx_size = 0;
+  for (pool = 0; pool < NUM_RX_POOLS; ++pool)
+    if (rxs_bs[pool] <= max_rx_size)
+      PRINTK (KERN_NOTICE, "useless pool (rxs_bs[%hu] = %u)",
+	      pool, rxs_bs[pool]);
+    else
+      max_rx_size = rxs_bs[pool];
+  
+  if (rx_lats < MIN_RX_BUFFERS)
+    PRINTK (KERN_NOTICE, "rx_lats has been raised to %u",
+	    rx_lats = MIN_RX_BUFFERS);
+  
+  return;
+}
+
+/********** module stuff **********/
+
+MODULE_AUTHOR(maintainer_string);
+MODULE_DESCRIPTION(description_string);
+MODULE_LICENSE("GPL");
+MODULE_FIRMWARE("atmsar11.fw");
+module_param(debug,   ushort, 0644);
+module_param(cmds,    uint, 0);
+module_param(txs,     uint, 0);
+module_param_array(rxs,     uint, NULL, 0);
+module_param_array(rxs_bs,  uint, NULL, 0);
+module_param(rx_lats, uint, 0);
+module_param(pci_lat, byte, 0);
+MODULE_PARM_DESC(debug,   "debug bitmap, see .h file");
+MODULE_PARM_DESC(cmds,    "number of command queue entries");
+MODULE_PARM_DESC(txs,     "number of TX queue entries");
+MODULE_PARM_DESC(rxs,     "number of RX queue entries [" __MODULE_STRING(NUM_RX_POOLS) "]");
+MODULE_PARM_DESC(rxs_bs,  "size of RX buffers [" __MODULE_STRING(NUM_RX_POOLS) "]");
+MODULE_PARM_DESC(rx_lats, "number of extra buffers to cope with RX latencies");
+MODULE_PARM_DESC(pci_lat, "PCI latency in bus cycles");
+
+/********** module entry **********/
+
+static struct pci_device_id amb_pci_tbl[] = {
+	{ PCI_VDEVICE(MADGE, PCI_DEVICE_ID_MADGE_AMBASSADOR), 0 },
+	{ PCI_VDEVICE(MADGE, PCI_DEVICE_ID_MADGE_AMBASSADOR_BAD), 0 },
+	{ 0, }
+};
+
+MODULE_DEVICE_TABLE(pci, amb_pci_tbl);
+
+static struct pci_driver amb_driver = {
+	.name =		"amb",
+	.probe =	amb_probe,
+	.remove =	amb_remove_one,
+	.id_table =	amb_pci_tbl,
+};
+
+static int __init amb_module_init (void)
+{
+  PRINTD (DBG_FLOW|DBG_INIT, "init_module");
+  
+  // sanity check - cast needed as printk does not support %Zu
+  if (sizeof(amb_mem) != 4*16 + 4*12) {
+    PRINTK (KERN_ERR, "Fix amb_mem (is %lu words).",
+	    (unsigned long) sizeof(amb_mem));
+    return -ENOMEM;
+  }
+  
+  show_version();
+  
+  amb_check_args();
+  
+  // get the juice
+  return pci_register_driver(&amb_driver);
+}
+
+/********** module exit **********/
+
+static void __exit amb_module_exit (void)
+{
+  PRINTD (DBG_FLOW|DBG_INIT, "cleanup_module");
+
+  pci_unregister_driver(&amb_driver);
+}
+
+module_init(amb_module_init);
+module_exit(amb_module_exit);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /* I2C access for DA9055 PMICs.
+ *
+ * Copyright(c) 2012 Dialog Semiconductor Ltd.
+ *
+ * Author: David Dajun Chen <dchen@diasemi.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ */
+
+#include <linux/module.h>
+#include <linux/device.h>
+#include <linux/i2c.h>
+#include <linux/err.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+
+#include <linux/mfd/da9055/core.h>
+
+static int da9055_i2c_probe(struct i2c_client *i2c,
+				      const struct i2c_device_id *id)
+{
+	struct da9055 *da9055;
+	int ret;
+
+	da9055 = devm_kzalloc(&i2c->dev, sizeof(struct da9055), GFP_KERNEL);
+	if (!da9055)
+		return -ENOMEM;
+
+	da9055->regmap = devm_regmap_init_i2c(i2c, &da9055_regmap_config);
+	if (IS_ERR(da9055->regmap)) {
+		ret = PTR_ERR(da9055->regmap);
+		dev_err(&i2c->dev, "Failed to allocate register map: %d\n",
+			ret);
+		return ret;
+	}
+
+	da9055->dev = &i2c->dev;
+	da9055->chip_irq = i2c->irq;
+
+	i2c_set_clientdata(i2c, da9055);
+
+	return da9055_device_init(da9055);
+}
+
+static int da9055_i2c_remove(struct i2c_client *i2c)
+{
+	struct da9055 *da9055 = i2c_get_clientdata(i2c);
+
+	da9055_device_exit(da9055);
+
+	return 0;
+}
+
+/*
+ * DO NOT change the device Ids. The naming is intentionally specific as both
+ * the PMIC and CODEC parts of this chip are instantiated separately as I2C
+ * devices (both have configurable I2C addresses, and are to all intents and
+ * purposes separate). As a result there are specific DA9055 ids for PMIC
+ * and CODEC, which must be different to operate together.
+ */
+static struct i2c_device_id da9055_i2c_id[] = {
+	{"da9055-pmic", 0},
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, da9055_i2c_id);
+
+static const struct of_device_id da9055_of_match[] = {
+	{ .compatible = "dlg,da9055-pmic", },
+	{ }
+};
+
+static struct i2c_driver da9055_i2c_driver = {
+	.probe = da9055_i2c_probe,
+	.remove = da9055_i2c_remove,
+	.id_table = da9055_i2c_id,
+	.driver = {
+		.name = "da9055-pmic",
+		.owner = THIS_MODULE,
+		.of_match_table = of_match_ptr(da9055_of_match),
+	},
+};
+
+static int __init da9055_i2c_init(void)
+{
+	int ret;
+
+	ret = i2c_add_driver(&da9055_i2c_driver);
+	if (ret != 0) {
+		pr_err("DA9055 I2C registration failed %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+subsys_initcall(da9055_i2c_init);
+
+static void __exit da9055_i2c_exit(void)
+{
+	i2c_del_driver(&da9055_i2c_driver);
+}
+module_exit(da9055_i2c_exit);
+
+MODULE_AUTHOR("David Dajun Chen <dchen@diasemi.com>");
+MODULE_DESCRIPTION("I2C driver for Dialog DA9055 PMIC");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         INDX( 	                 (   ¸   è      8 e _                   ×=    € l     Í=    [nèî3Ô’S0ç2ÔL‰èî3ÔVnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                   Í=    [nèî3Ô’S0ç2ÔL‰èî3ÔVnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                   L‰èî3ÔVnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                   Vnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e 8 . h                   Vnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                   L‰èî3ÔVnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                   L‰èî3ÔVnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                   Vnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                   [nèî3Ô’S0ç2ÔL‰èî3ÔVnèî3Ô       ¿               u n i q _ k e y _ s p l a y 8 t r e e . h                   L‰èî3ÔVnèî3Ô       ¿               u n i q _ k e y _ s p l a y _ t r e e . h                                                                                                                                                                                                                                                                                                                                                                                                         8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               8 /*
+ * Copyright (c) 2013 Johannes Berg <johannes@sipsolutions.net>
+ *
+ *  This file is free software: you may copy, redistribute and/or modify it
+ *  under the terms of the GNU General Public License as published by the
+ *  Free Software Foundation, either version 2 of the License, or (at your
+ *  option) any later version.
+ *
+ *  This file is distributed in the hope that it will be useful, but
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *  General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * This file incorporates work covered by the following copyright and
+ * permission notice:
+ *
+ * Copyright (c) 2012 Qualcomm Atheros, Inc.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <linux/pci.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/ethtool.h>
+#include <linux/mdio.h>
+#include <linux/interrupt.h>
+#include <asm/byteorder.h>
+
+#include "alx.h"
+#include "reg.h"
+#include "hw.h"
+
+/* The order of these strings must match the order of the fields in
+ * struct alx_hw_stats
+ * See hw.h
+ */
+static const char alx_gstrings_stats[][ETH_GSTRING_LEN] = {
+	"rx_packets",
+	"rx_bcast_packets",
+	"rx_mcast_packets",
+	"rx_pause_packets",
+	"rx_ctrl_packets",
+	"rx_fcs_errors",
+	"rx_length_errors",
+	"rx_bytes",
+	"rx_runt_packets",
+	"rx_fragments",
+	"rx_64B_or_less_packets",
+	"rx_65B_to_127B_packets",
+	"rx_128B_to_255B_packets",
+	"rx_256B_to_511B_packets",
+	"rx_512B_to_1023B_packets",
+	"rx_1024B_to_1518B_packets",
+	"rx_1519B_to_mtu_packets",
+	"rx_oversize_packets",
+	"rx_rxf_ov_drop_packets",
+	"rx_rrd_ov_drop_packets",
+	"rx_align_errors",
+	"rx_bcast_bytes",
+	"rx_mcast_bytes",
+	"rx_address_errors",
+	"tx_packets",
+	"tx_bcast_packets",
+	"tx_mcast_packets",
+	"tx_pause_packets",
+	"tx_exc_defer_packets",
+	"tx_ctrl_packets",
+	"tx_defer_packets",
+	"tx_bytes",
+	"tx_64B_or_less_packets",
+	"tx_65B_to_127B_packets",
+	"tx_128B_to_255B_packets",
+	"tx_256B_to_511B_packets",
+	"tx_512B_to_1023B_packets",
+	"tx_1024B_to_1518B_packets",
+	"tx_1519B_to_mtu_packets",
+	"tx_single_collision",
+	"tx_multiple_collisions",
+	"tx_late_collision",
+	"tx_abort_collision",
+	"tx_underrun",
+	"tx_trd_eop",
+	"tx_length_errors",
+	"tx_trunc_packets",
+	"tx_bcast_bytes",
+	"tx_mcast_bytes",
+	"tx_update",
+};
+
+#define ALX_NUM_STATS ARRAY_SIZE(alx_gstrings_stats)
+
+
+static u32 alx_get_supported_speeds(struct alx_hw *hw)
+{
+	u32 supported = SUPPORTED_10baseT_Half |
+			SUPPORTED_10baseT_Full |
+			SUPPORTED_100baseT_Half |
+			SUPPORTED_100baseT_Full;
+
+	if (alx_hw_giga(hw))
+		supported |= SUPPORTED_1000baseT_Full;
+
+	BUILD_BUG_ON(SUPPORTED_10baseT_Half != ADVERTISED_10baseT_Half);
+	BUILD_BUG_ON(SUPPORTED_10baseT_Full != ADVERTISED_10baseT_Full);
+	BUILD_BUG_ON(SUPPORTED_100baseT_Half != ADVERTISED_100baseT_Half);
+	BUILD_BUG_ON(SUPPORTED_100baseT_Full != ADVERTISED_100baseT_Full);
+	BUILD_BUG_ON(SUPPORTED_1000baseT_Full != ADVERTISED_1000baseT_Full);
+
+	return supported;
+}
+
+static int alx_get_settings(struct net_device *netdev, struct ethtool_cmd *ecmd)
+{
+	struct alx_priv *alx = netdev_priv(netdev);
+	struct alx_hw *hw = &alx->hw;
+
+	ecmd->supported = SUPPORTED_Autoneg |
+			  SUPPORTED_TP |
+			  SUPPORTED_Pause |
+			  SUPPORTED_Asym_Pause;
+	if (alx_hw_giga(hw))
+		ecmd->supported |= SUPPORTED_1000baseT_Full;
+	ecmd->supported |= alx_get_supported_speeds(hw);
+
+	ecmd->advertising = ADVERTISED_TP;
+	if (hw->adv_cfg & ADVERTISED_Autoneg)
+		ecmd->advertising |= hw->adv_cfg;
+
+	ecmd->port = PORT_TP;
+	ecmd->phy_address = 0;
+
+	if (hw->adv_cfg & ADVERTISED_Autoneg)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	if (hw->flowctrl & ALX_FC_ANEG && hw->adv_cfg & ADVERTISED_Autoneg) {
+		if (hw->flowctrl & ALX_FC_RX) {
+			ecmd->advertising |= ADVERTISED_Pause;
+
+			if (!(hw->flowctrl & ALX_FC_TX))
+				ecmd->advertising |= ADVERTISED_Asym_Pause;
+		} else if (hw->flowctrl & ALX_FC_TX) {
+			ecmd->advertising |= ADVERTISED_Asym_Pause;
+		}
+	}
+
+	ethtool_cmd_speed_set(ecmd, hw->link_speed);
+	ecmd->duplex = hw->duplex;
+
+	return 0;
+}
+
+static int alx_set_settings(struct net_device *netdev, struct ethtool_cmd *ecmd)
+{
+	struct alx_priv *alx = netdev_priv(netdev);
+	struct alx_hw *hw = &alx->hw;
+	u32 adv_cfg;
+
+	ASSERT_RTNL();
+
+	if (ecmd->autoneg == AUTONEG_ENABLE) {
+		if (ecmd->advertising & ~alx_get_supported_speeds(hw))
+			return -EINVAL;
+		adv_cfg = ecmd->advertising | ADVERTISED_Autoneg;
+	} else {
+		adv_cfg = alx_speed_to_ethadv(ethtool_cmd_speed(ecmd),
+					      ecmd->duplex);
+
+		if (!adv_cfg || adv_cfg == ADVERTISED_1000baseT_Full)
+			return -EINVAL;
+	}
+
+	hw->adv_cfg = adv_cfg;
+	return alx_setup_speed_duplex(hw, adv_cfg, hw->flowctrl);
+}
+
+static void alx_get_pauseparam(struct net_device *netdev,
+			       struct ethtool_pauseparam *pause)
+{
+	struct alx_priv *alx = netdev_priv(netdev);
+	struct alx_hw *hw = &alx->hw;
+
+	pause->autoneg = !!(hw->flowctrl & ALX_FC_ANEG &&
+			    hw->adv_cfg & ADVERTISED_Autoneg);
+	pause->tx_pause = !!(hw->flowctrl & ALX_FC_TX);
+	pause->rx_pause = !!(hw->flowctrl & ALX_FC_RX);
+}
+
+
+static int alx_set_pauseparam(struct net_device *netdev,
+			      struct ethtool_pauseparam *pause)
+{
+	struct alx_priv *alx = netdev_priv(netdev);
+	struct alx_hw *hw = &alx->hw;
+	int err = 0;
+	bool reconfig_phy = false;
+	u8 fc = 0;
+
+	if (pause->tx_pause)
+		fc |= ALX_FC_TX;
+	if (pause->rx_pause)
+		fc |= ALX_FC_RX;
+	if (pause->autoneg)
+		fc |= ALX_FC_ANEG;
+
+	ASSERT_RTNL();
+
+	/* restart auto-neg for auto-mode */
+	if (hw->adv_cfg & ADVERTISED_Autoneg) {
+		if (!((fc ^ hw->flowctrl) & ALX_FC_ANEG))
+			reconfig_phy = true;
+		if (fc & hw->flowctrl & ALX_FC_ANEG &&
+		    (fc ^ hw->flowctrl) & (ALX_FC_RX | ALX_FC_TX))
+			reconfig_phy = true;
+	}
+
+	if (reconfig_phy) {
+		err = alx_setup_speed_duplex(hw, hw->adv_cfg, fc);
+		if (err)
+			return err;
+	}
+
+	/* flow control on mac */
+	if ((fc ^ hw->flowctrl) & (ALX_FC_RX | ALX_FC_TX))
+		alx_cfg_mac_flowcontrol(hw, fc);
+
+	hw->flowctrl = fc;
+
+	return 0;
+}
+
+static u32 alx_get_msglevel(struct net_device *netdev)
+{
+	struct alx_priv *alx = netdev_priv(netdev);
+
+	return alx->msg_enable;
+}
+
+static void alx_set_msglevel(struct net_device *netdev, u32 data)
+{
+	struct alx_priv *alx = netdev_priv(netdev);
+
+	alx->msg_enable = data;
+}
+
+static void alx_get_ethtool_stats(struct net_device *netdev,
+				  struct ethtool_stats *estats, u64 *data)
+{
+	struct alx_priv *alx = netdev_priv(netdev);
+	struct alx_hw *hw = &alx->hw;
+
+	spin_lock(&alx->stats_lock);
+
+	alx_update_hw_stats(hw);
+	BUILD_BUG_ON(sizeof(hw->stats) - offsetof(struct alx_hw_stats, rx_ok) <
+		     ALX_NUM_STATS * sizeof(u64));
+	memcpy(data, &hw->stats.rx_ok, ALX_NUM_STATS * sizeof(u64));
+
+	spin_unlock(&alx->stats_lock);
+}
+
+static void alx_get_strings(struct net_device *netdev, u32 stringset, u8 *buf)
+{
+	switch (stringset) {
+	case ETH_SS_STATS:
+		memcpy(buf, &alx_gstrings_stats, sizeof(alx_gstrings_stats));
+		break;
+	default:
+		WARN_ON(1);
+		break;
+	}
+}
+
+static int alx_get_sset_count(struct net_device *netdev, int sset)
+{
+	switch (sset) {
+	case ETH_SS_STATS:
+		return ALX_NUM_STATS;
+	default:
+		return -EINVAL;
+	}
+}
+
+const struct ethtool_ops alx_ethtool_ops = {
+	.get_settings	= alx_get_settings,
+	.set_settings	= alx_set_settings,
+	.get_pauseparam	= alx_get_pauseparam,
+	.set_pauseparam	= alx_set_pauseparam,
+	.get_msglevel	= alx_get_msglevel,
+	.set_msglevel	= alx_set_msglevel,
+	.get_link	= ethtool_op_get_link,
+	.get_strings	= alx_get_strings,
+	.get_sset_count	= alx_get_sset_count,
+	.get_ethtool_stats	= alx_get_ethtool_stats,
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * Copyright (c) 2006 Damien Bergamini <damien.bergamini@free.fr>
+ * Copyright (c) 2006 Sam Leffler, Errno Consulting
+ * Copyright (c) 2007 Christoph Hellwig <hch@lst.de>
+ * Copyright (c) 2008-2009 Weongyo Jeong <weongyo@freebsd.org>
+ * Copyright (c) 2012 Pontus Fuchs <pontus.fuchs@gmail.com>
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/* all fields are big endian */
+struct ar5523_fwblock {
+	__be32		flags;
+#define AR5523_WRITE_BLOCK	(1 << 4)
+
+	__be32	len;
+#define AR5523_MAX_FWBLOCK_SIZE	2048
+
+	__be32		total;
+	__be32		remain;
+	__be32		rxtotal;
+	__be32		pad[123];
+} __packed;
+
+#define AR5523_MAX_RXCMDSZ	1024
+#define AR5523_MAX_TXCMDSZ	1024
+
+struct ar5523_cmd_hdr {
+	__be32		len;
+	__be32		code;
+/* NB: these are defined for rev 1.5 firmware; rev 1.6 is different */
+/* messages from Host -> Target */
+#define	WDCMSG_HOST_AVAILABLE		0x01
+#define WDCMSG_BIND			0x02
+#define WDCMSG_TARGET_RESET		0x03
+#define WDCMSG_TARGET_GET_CAPABILITY	0x04
+#define WDCMSG_TARGET_SET_CONFIG	0x05
+#define WDCMSG_TARGET_GET_STATUS	0x06
+#define WDCMSG_TARGET_GET_STATS		0x07
+#define WDCMSG_TARGET_START		0x08
+#define WDCMSG_TARGET_STOP		0x09
+#define WDCMSG_TARGET_ENABLE		0x0a
+#define WDCMSG_TARGET_DISABLE		0x0b
+#define	WDCMSG_CREATE_CONNECTION	0x0c
+#define WDCMSG_UPDATE_CONNECT_ATTR	0x0d
+#define	WDCMSG_DELETE_CONNECT		0x0e
+#define	WDCMSG_SEND			0x0f
+#define WDCMSG_FLUSH			0x10
+/* messages from Target -> Host */
+#define	WDCMSG_STATS_UPDATE		0x11
+#define	WDCMSG_BMISS			0x12
+#define	WDCMSG_DEVICE_AVAIL		0x13
+#define	WDCMSG_SEND_COMPLETE		0x14
+#define	WDCMSG_DATA_AVAIL		0x15
+#define	WDCMSG_SET_PWR_MODE		0x16
+#define	WDCMSG_BMISS_ACK		0x17
+#define	WDCMSG_SET_LED_STEADY		0x18
+#define	WDCMSG_SET_LED_BLINK		0x19
+/* more messages */
+#define	WDCMSG_SETUP_BEACON_DESC	0x1a
+#define	WDCMSG_BEACON_INIT		0x1b
+#define	WDCMSG_RESET_KEY_CACHE		0x1c
+#define	WDCMSG_RESET_KEY_CACHE_ENTRY	0x1d
+#define	WDCMSG_SET_KEY_CACHE_ENTRY	0x1e
+#define	WDCMSG_SET_DECOMP_MASK		0x1f
+#define	WDCMSG_SET_REGULATORY_DOMAIN	0x20
+#define	WDCMSG_SET_LED_STATE		0x21
+#define	WDCMSG_WRITE_ASSOCID		0x22
+#define	WDCMSG_SET_STA_BEACON_TIMERS	0x23
+#define	WDCMSG_GET_TSF			0x24
+#define	WDCMSG_RESET_TSF		0x25
+#define	WDCMSG_SET_ADHOC_MODE		0x26
+#define	WDCMSG_SET_BASIC_RATE		0x27
+#define	WDCMSG_MIB_CONTROL		0x28
+#define	WDCMSG_GET_CHANNEL_DATA		0x29
+#define	WDCMSG_GET_CUR_RSSI		0x2a
+#define	WDCMSG_SET_ANTENNA_SWITCH	0x2b
+#define	WDCMSG_USE_SHORT_SLOT_TIME	0x2f
+#define	WDCMSG_SET_POWER_MODE		0x30
+#define	WDCMSG_SETUP_PSPOLL_DESC	0x31
+#define	WDCMSG_SET_RX_MULTICAST_FILTER	0x32
+#define	WDCMSG_RX_FILTER		0x33
+#define	WDCMSG_PER_CALIBRATION		0x34
+#define	WDCMSG_RESET			0x35
+#define	WDCMSG_DISABLE			0x36
+#define	WDCMSG_PHY_DISABLE		0x37
+#define	WDCMSG_SET_TX_POWER_LIMIT	0x38
+#define	WDCMSG_SET_TX_QUEUE_PARAMS	0x39
+#define	WDCMSG_SETUP_TX_QUEUE		0x3a
+#define	WDCMSG_RELEASE_TX_QUEUE		0x3b
+#define	WDCMSG_SET_DEFAULT_KEY		0x43
+
+	__u32		priv;	/* driver private data,
+				   don't care about endianess */
+	__be32		magic;
+	__be32		reserved2[4];
+};
+
+struct ar5523_cmd_host_available {
+	__be32	sw_ver_major;
+	__be32	sw_ver_minor;
+	__be32	sw_ver_patch;
+	__be32	sw_ver_build;
+} __packed;
+
+#define	ATH_SW_VER_MAJOR	1
+#define	ATH_SW_VER_MINOR	5
+#define	ATH_SW_VER_PATCH	0
+#define	ATH_SW_VER_BUILD	9999
+
+struct ar5523_chunk {
+	u8		seqnum;		/* sequence number for ordering */
+	u8		flags;
+#define	UATH_CFLAGS_FINAL	0x01	/* final chunk of a msg */
+#define	UATH_CFLAGS_RXMSG	0x02	/* chunk contains rx completion */
+#define	UATH_CFLAGS_DEBUG	0x04	/* for debugging */
+	__be16		length;		/* chunk size in bytes */
+	/* chunk data follows */
+} __packed;
+
+/*
+ * Message format for a WDCMSG_DATA_AVAIL message from Target to Host.
+ */
+struct ar5523_rx_desc {
+	__be32	len;		/* msg length including header */
+	__be32	code;		/* WDCMSG_DATA_AVAIL */
+	__be32	gennum;		/* generation number */
+	__be32	status;		/* start of RECEIVE_INFO */
+#define	UATH_STATUS_OK			0
+#define	UATH_STATUS_STOP_IN_PROGRESS	1
+#define	UATH_STATUS_CRC_ERR		2
+#define	UATH_STATUS_PHY_ERR		3
+#define	UATH_STATUS_DECRYPT_CRC_ERR	4
+#define	UATH_STATUS_DECRYPT_MIC_ERR	5
+#define	UATH_STATUS_DECOMP_ERR		6
+#define	UATH_STATUS_KEY_ERR		7
+#define	UATH_STATUS_ERR			8
+	__be32	tstamp_low;	/* low-order 32-bits of rx timestamp */
+	__be32	tstamp_high;	/* high-order 32-bits of rx timestamp */
+	__be32	framelen;	/* frame length */
+	__be32	rate;		/* rx rate code */
+	__be32	antenna;
+	__be32	rssi;
+	__be32	channel;
+	__be32	phyerror;
+	__be32	connix;		/* key table ix for bss traffic */
+	__be32	decrypterror;
+	__be32	keycachemiss;
+	__be32	pad;		/* XXX? */
+} __packed;
+
+struct ar5523_tx_desc {
+	__be32	msglen;
+	u32	msgid;		/* msg id (supplied by host) */
+	__be32	type;		/* opcode: WDMSG_SEND or WDCMSG_FLUSH */
+	__be32	txqid;		/* tx queue id and flags */
+#define	UATH_TXQID_MASK		0x0f
+#define	UATH_TXQID_MINRATE	0x10	/* use min tx rate */
+#define	UATH_TXQID_FF		0x20	/* content is fast frame */
+	__be32	connid;		/* tx connection id */
+#define UATH_ID_INVALID	0xffffffff	/* for sending prior to connection */
+	__be32	flags;		/* non-zero if response desired */
+#define UATH_TX_NOTIFY	(1 << 24)	/* f/w will send a UATH_NOTIF_TX */
+	__be32	buflen;		/* payload length */
+} __packed;
+
+
+#define AR5523_ID_BSS		2
+#define AR5523_ID_BROADCAST	0xffffffff
+
+/* structure for command UATH_CMD_WRITE_MAC */
+struct ar5523_write_mac {
+	__be32	reg;
+	__be32	len;
+	u8		data[32];
+} __packed;
+
+struct ar5523_cmd_rateset {
+	__u8		length;
+#define AR5523_MAX_NRATES	32
+	__u8		set[AR5523_MAX_NRATES];
+};
+
+struct ar5523_cmd_set_associd {		/* AR5523_WRITE_ASSOCID */
+	__be32	defaultrateix;
+	__be32	associd;
+	__be32	timoffset;
+	__be32	turboprime;
+	__u8	bssid[6];
+} __packed;
+
+/* structure for command WDCMSG_RESET */
+struct ar5523_cmd_reset {
+	__be32	flags;		/* channel flags */
+#define	UATH_CHAN_TURBO	0x0100
+#define	UATH_CHAN_CCK	0x0200
+#define	UATH_CHAN_OFDM	0x0400
+#define	UATH_CHAN_2GHZ	0x1000
+#define	UATH_CHAN_5GHZ	0x2000
+	__be32	freq;		/* channel frequency */
+	__be32	maxrdpower;
+	__be32	cfgctl;
+	__be32	twiceantennareduction;
+	__be32	channelchange;
+	__be32	keeprccontent;
+} __packed;
+
+/* structure for command WDCMSG_SET_BASIC_RATE */
+struct ar5523_cmd_rates {
+	__be32	connid;
+	__be32	keeprccontent;
+	__be32	size;
+	struct ar5523_cmd_rateset rateset;
+} __packed;
+
+enum {
+	WLAN_MODE_NONE = 0,
+	WLAN_MODE_11b,
+	WLAN_MODE_11a,
+	WLAN_MODE_11g,
+	WLAN_MODE_11a_TURBO,
+	WLAN_MODE_11g_TURBO,
+	WLAN_MODE_11a_TURBO_PRIME,
+	WLAN_MODE_11g_TURBO_PRIME,
+	WLAN_MODE_11a_XR,
+	WLAN_MODE_11g_XR,
+};
+
+struct ar5523_cmd_connection_attr {
+	__be32	longpreambleonly;
+	struct ar5523_cmd_rateset	rateset;
+	__be32	wlanmode;
+} __packed;
+
+/* structure for command AR5523_CREATE_CONNECTION */
+struct ar5523_cmd_create_connection {
+	__be32	connid;
+	__be32	bssid;
+	__be32	size;
+	struct ar5523_cmd_connection_attr	connattr;
+} __packed;
+
+struct ar5523_cmd_ledsteady {		/* WDCMSG_SET_LED_STEADY */
+	__be32	lednum;
+#define UATH_LED_LINK		0
+#define UATH_LED_ACTIVITY	1
+	__be32	ledmode;
+#define UATH_LED_OFF	0
+#define UATH_LED_ON	1
+} __packed;
+
+struct ar5523_cmd_ledblink {		/* WDCMSG_SET_LED_BLINK */
+	__be32	lednum;
+	__be32	ledmode;
+	__be32	blinkrate;
+	__be32	slowmode;
+} __packed;
+
+struct ar5523_cmd_ledstate {		/* WDCMSG_SET_LED_STATE */
+	__be32	connected;
+} __packed;
+
+struct ar5523_cmd_txq_attr {
+	__be32	priority;
+	__be32	aifs;
+	__be32	logcwmin;
+	__be32	logcwmax;
+	__be32	bursttime;
+	__be32	mode;
+	__be32	qflags;
+} __packed;
+
+struct ar5523_cmd_txq_setup {		/* WDCMSG_SETUP_TX_QUEUE */
+	__be32	qid;
+	__be32	len;
+	struct ar5523_cmd_txq_attr attr;
+} __packed;
+
+struct ar5523_cmd_rx_filter {		/* WDCMSG_RX_FILTER */
+	__be32	bits;
+#define UATH_FILTER_RX_UCAST		0x00000001
+#define UATH_FILTER_RX_MCAST		0x00000002
+#define UATH_FILTER_RX_BCAST		0x00000004
+#define UATH_FILTER_RX_CONTROL		0x00000008
+#define UATH_FILTER_RX_BEACON		0x00000010	/* beacon frames */
+#define UATH_FILTER_RX_PROM		0x00000020	/* promiscuous mode */
+#define UATH_FILTER_RX_PHY_ERR		0x00000040	/* phy errors */
+#define UATH_FILTER_RX_PHY_RADAR	0x00000080	/* radar phy errors */
+#define UATH_FILTER_RX_XR_POOL		0x00000400	/* XR group polls */
+#define UATH_FILTER_RX_PROBE_REQ	0x00000800
+	__be32	op;
+#define UATH_FILTER_OP_INIT		0x0
+#define UATH_FILTER_OP_SET		0x1
+#define UATH_FILTER_OP_CLEAR		0x2
+#define UATH_FILTER_OP_TEMP		0x3
+#define UATH_FILTER_OP_RESTORE		0x4
+} __packed;
+
+enum {
+	CFG_NONE,			/* Sentinal to indicate "no config" */
+	CFG_REG_DOMAIN,			/* Regulatory Domain */
+	CFG_RATE_CONTROL_ENABLE,
+	CFG_DEF_XMIT_DATA_RATE,		/* NB: if rate control is not enabled */
+	CFG_HW_TX_RETRIES,
+	CFG_SW_TX_RETRIES,
+	CFG_SLOW_CLOCK_ENABLE,
+	CFG_COMP_PROC,
+	CFG_USER_RTS_THRESHOLD,
+	CFG_XR2NORM_RATE_THRESHOLD,
+	CFG_XRMODE_SWITCH_COUNT,
+	CFG_PROTECTION_TYPE,
+	CFG_BURST_SEQ_THRESHOLD,
+	CFG_ABOLT,
+	CFG_IQ_LOG_COUNT_MAX,
+	CFG_MODE_CTS,
+	CFG_WME_ENABLED,
+	CFG_GPRS_CBR_PERIOD,
+	CFG_SERVICE_TYPE,
+	/* MAC Address to use.  Overrides EEPROM */
+	CFG_MAC_ADDR,
+	CFG_DEBUG_EAR,
+	CFG_INIT_REGS,
+	/* An ID for use in error & debug messages */
+	CFG_DEBUG_ID,
+	CFG_COMP_WIN_SZ,
+	CFG_DIVERSITY_CTL,
+	CFG_TP_SCALE,
+	CFG_TPC_HALF_DBM5,
+	CFG_TPC_HALF_DBM2,
+	CFG_OVERRD_TX_POWER,
+	CFG_USE_32KHZ_CLOCK,
+	CFG_GMODE_PROTECTION,
+	CFG_GMODE_PROTECT_RATE_INDEX,
+	CFG_GMODE_NON_ERP_PREAMBLE,
+	CFG_WDC_TRANSPORT_CHUNK_SIZE,
+};
+
+enum {
+	/* Sentinal to indicate "no capability" */
+	CAP_NONE,
+	CAP_ALL,			/* ALL capabilities */
+	CAP_TARGET_VERSION,
+	CAP_TARGET_REVISION,
+	CAP_MAC_VERSION,
+	CAP_MAC_REVISION,
+	CAP_PHY_REVISION,
+	CAP_ANALOG_5GHz_REVISION,
+	CAP_ANALOG_2GHz_REVISION,
+	/* Target supports WDC message debug features */
+	CAP_DEBUG_WDCMSG_SUPPORT,
+
+	CAP_REG_DOMAIN,
+	CAP_COUNTRY_CODE,
+	CAP_REG_CAP_BITS,
+
+	CAP_WIRELESS_MODES,
+	CAP_CHAN_SPREAD_SUPPORT,
+	CAP_SLEEP_AFTER_BEACON_BROKEN,
+	CAP_COMPRESS_SUPPORT,
+	CAP_BURST_SUPPORT,
+	CAP_FAST_FRAMES_SUPPORT,
+	CAP_CHAP_TUNING_SUPPORT,
+	CAP_TURBOG_SUPPORT,
+	CAP_TURBO_PRIME_SUPPORT,
+	CAP_DEVICE_TYPE,
+	CAP_XR_SUPPORT,
+	CAP_WME_SUPPORT,
+	CAP_TOTAL_QUEUES,
+	CAP_CONNECTION_ID_MAX,		/* Should absorb CAP_KEY_CACHE_SIZE */
+
+	CAP_LOW_5GHZ_CHAN,
+	CAP_HIGH_5GHZ_CHAN,
+	CAP_LOW_2GHZ_CHAN,
+	CAP_HIGH_2GHZ_CHAN,
+
+	CAP_MIC_AES_CCM,
+	CAP_MIC_CKIP,
+	CAP_MIC_TKIP,
+	CAP_MIC_TKIP_WME,
+	CAP_CIPHER_AES_CCM,
+	CAP_CIPHER_CKIP,
+	CAP_CIPHER_TKIP,
+
+	CAP_TWICE_ANTENNAGAIN_5G,
+	CAP_TWICE_ANTENNAGAIN_2G,
+};
+
+enum {
+	ST_NONE,                    /* Sentinal to indicate "no status" */
+	ST_ALL,
+	ST_SERVICE_TYPE,
+	ST_WLAN_MODE,
+	ST_FREQ,
+	ST_BAND,
+	ST_LAST_RSSI,
+	ST_PS_FRAMES_DROPPED,
+	ST_CACHED_DEF_ANT,
+	ST_COUNT_OTHER_RX_ANT,
+	ST_USE_FAST_DIVERSITY,
+	ST_MAC_ADDR,
+	ST_RX_GENERATION_NUM,
+	ST_TX_QUEUE_DEPTH,
+	ST_SERIAL_NUMBER,
+	ST_WDC_TRANSPORT_CHUNK_SIZE,
+};
+
+enum {
+	TARGET_DEVICE_AWAKE,
+	TARGET_DEVICE_SLEEP,
+	TARGET_DEVICE_PWRDN,
+	TARGET_DEVICE_PWRSAVE,
+	TARGET_DEVICE_SUSPEND,
+	TARGET_DEVICE_RESUME,
+};
+
+/* this is in net/ieee80211.h, but that conflicts with the mac80211 headers */
+#define IEEE80211_2ADDR_LEN	16
+
+#define AR5523_MIN_RXBUFSZ				\
+	(((sizeof(__be32) + IEEE80211_2ADDR_LEN +	\
+	   sizeof(struct ar5523_rx_desc)) + 3) & ~3)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /******************************************************************************
+ *
+ * Copyright(c) 2009-2014  Realtek Corporation.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * The full GNU General Public License is included in this distribution in the
+ * file called LICENSE.
+ *
+ * Contact Information:
+ * wlanfae <wlanfae@realtek.com>
+ * Realtek Corporation, No. 2, Innovation Road II, Hsinchu Science Park,
+ * Hsinchu 300, Taiwan.
+ *
+ * Larry Finger <Larry.Finger@lwfinger.net>
+ *
+ *****************************************************************************/
+
+#ifndef __RTL8723BE_HW_H__
+#define __RTL8723BE_HW_H__
+
+void rtl8723be_get_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val);
+void rtl8723be_read_eeprom_info(struct ieee80211_hw *hw);
+
+void rtl8723be_interrupt_recognized(struct ieee80211_hw *hw,
+				    u32 *p_inta, u32 *p_intb);
+int rtl8723be_hw_init(struct ieee80211_hw *hw);
+void rtl8723be_card_disable(struct ieee80211_hw *hw);
+void rtl8723be_enable_interrupt(struct ieee80211_hw *hw);
+void rtl8723be_disable_interrupt(struct ieee80211_hw *hw);
+int rtl8723be_set_network_type(struct ieee80211_hw *hw,
+			       enum nl80211_iftype type);
+void rtl8723be_set_check_bssid(struct ieee80211_hw *hw, bool check_bssid);
+void rtl8723be_set_qos(struct ieee80211_hw *hw, int aci);
+void rtl8723be_set_beacon_related_registers(struct ieee80211_hw *hw);
+void rtl8723be_set_beacon_interval(struct ieee80211_hw *hw);
+void rtl8723be_update_interrupt_mask(struct ieee80211_hw *hw,
+				     u32 add_msr, u32 rm_msr);
+void rtl8723be_set_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val);
+void rtl8723be_update_hal_rate_tbl(struct ieee80211_hw *hw,
+				   struct ieee80211_sta *sta,
+				   u8 rssi_level);
+void rtl8723be_update_channel_access_setting(struct ieee80211_hw *hw);
+bool rtl8723be_gpio_radio_on_off_checking(struct ieee80211_hw *hw, u8 *valid);
+void rtl8723be_enable_hw_security_config(struct ieee80211_hw *hw);
+void rtl8723be_set_key(struct ieee80211_hw *hw, u32 key_index,
+		       u8 *p_macaddr, bool is_group, u8 enc_algo,
+		       bool is_wepkey, bool clear_all);
+void rtl8723be_read_bt_coexist_info_from_hwpg(struct ieee80211_hw *hw,
+					      bool autoload_fail, u8 *hwinfo);
+void rtl8723be_bt_reg_init(struct ieee80211_hw *hw);
+void rtl8723be_bt_hw_init(struct ieee80211_hw *hw);
+void rtl8723be_suspend(struct ieee80211_hw *hw);
+void rtl8723be_resume(struct ieee80211_hw *hw);
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /* rtc-sun4v.c: Hypervisor based RTC for SUN4V systems.
+ *
+ * Copyright (C) 2008 David S. Miller <davem@davemloft.net>
+ */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/delay.h>
+#include <linux/init.h>
+#include <linux/rtc.h>
+#include <linux/platform_device.h>
+
+#include <asm/hypervisor.h>
+
+static unsigned long hypervisor_get_time(void)
+{
+	unsigned long ret, time;
+	int retries = 10000;
+
+retry:
+	ret = sun4v_tod_get(&time);
+	if (ret == HV_EOK)
+		return time;
+	if (ret == HV_EWOULDBLOCK) {
+		if (--retries > 0) {
+			udelay(100);
+			goto retry;
+		}
+		pr_warn("tod_get() timed out.\n");
+		return 0;
+	}
+	pr_warn("tod_get() not supported.\n");
+	return 0;
+}
+
+static int sun4v_read_time(struct device *dev, struct rtc_time *tm)
+{
+	rtc_time_to_tm(hypervisor_get_time(), tm);
+	return 0;
+}
+
+static int hypervisor_set_time(unsigned long secs)
+{
+	unsigned long ret;
+	int retries = 10000;
+
+retry:
+	ret = sun4v_tod_set(secs);
+	if (ret == HV_EOK)
+		return 0;
+	if (ret == HV_EWOULDBLOCK) {
+		if (--retries > 0) {
+			udelay(100);
+			goto retry;
+		}
+		pr_warn("tod_set() timed out.\n");
+		return -EAGAIN;
+	}
+	pr_warn("tod_set() not supported.\n");
+	return -EOPNOTSUPP;
+}
+
+static int sun4v_set_time(struct device *dev, struct rtc_time *tm)
+{
+	unsigned long secs;
+	int err;
+
+	err = rtc_tm_to_time(tm, &secs);
+	if (err)
+		return err;
+
+	return hypervisor_set_time(secs);
+}
+
+static const struct rtc_class_ops sun4v_rtc_ops = {
+	.read_time	= sun4v_read_time,
+	.set_time	= sun4v_set_time,
+};
+
+static int __init sun4v_rtc_probe(struct platform_device *pdev)
+{
+	struct rtc_device *rtc;
+
+	rtc = devm_rtc_device_register(&pdev->dev, "sun4v",
+				&sun4v_rtc_ops, THIS_MODULE);
+	if (IS_ERR(rtc))
+		return PTR_ERR(rtc);
+
+	platform_set_drvdata(pdev, rtc);
+	return 0;
+}
+
+static struct platform_driver sun4v_rtc_driver = {
+	.driver		= {
+		.name	= "rtc-sun4v",
+		.owner	= THIS_MODULE,
+	},
+};
+
+module_platform_driver_probe(sun4v_rtc_driver, sun4v_rtc_probe);
+
+MODULE_AUTHOR("David S. Miller <davem@davemloft.net>");
+MODULE_DESCRIPTION("SUN4V RTC driver");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * comedi/drivers/adv_pci1710.c
+ *
+ * Author: Michal Dobes <dobes@tesnet.cz>
+ *
+ * Thanks to ZhenGang Shang <ZhenGang.Shang@Advantech.com.cn>
+ * for testing and informations.
+ *
+ *  hardware driver for Advantech cards:
+ *   card:   PCI-1710, PCI-1710HG, PCI-1711, PCI-1713, PCI-1720, PCI-1731
+ *   driver: pci1710,  pci1710hg,  pci1711,  pci1713,  pci1720,  pci1731
+ *
+ * Options:
+ *  [0] - PCI bus number - if bus number and slot number are 0,
+ *                         then driver search for first unused card
+ *  [1] - PCI slot number
+ *
+*/
+/*
+Driver: adv_pci1710
+Description: Advantech PCI-1710, PCI-1710HG, PCI-1711, PCI-1713,
+	     Advantech PCI-1720, PCI-1731
+Author: Michal Dobes <dobes@tesnet.cz>
+Devices: [Advantech] PCI-1710 (adv_pci1710), PCI-1710HG (pci1710hg),
+  PCI-1711 (adv_pci1710), PCI-1713, PCI-1720,
+  PCI-1731
+Status: works
+
+This driver supports AI, AO, DI and DO subdevices.
+AI subdevice supports cmd and insn interface,
+other subdevices support only insn interface.
+
+The PCI-1710 and PCI-1710HG have the same PCI device ID, so the
+driver cannot distinguish between them, as would be normal for a
+PCI driver.
+
+Configuration options:
+  [0] - PCI bus of device (optional)
+  [1] - PCI slot of device (optional)
+	If bus/slot is not specified, the first available PCI
+	device will be used.
+*/
+
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/interrupt.h>
+
+#include "../comedidev.h"
+
+#include "comedi_fc.h"
+#include "8253.h"
+#include "amcc_s5933.h"
+
+/* hardware types of the cards */
+#define TYPE_PCI171X	0
+#define TYPE_PCI1713	2
+#define TYPE_PCI1720	3
+
+#define PCI171x_AD_DATA	 0	/* R:   A/D data */
+#define PCI171x_SOFTTRG	 0	/* W:   soft trigger for A/D */
+#define PCI171x_RANGE	 2	/* W:   A/D gain/range register */
+#define PCI171x_MUX	 4	/* W:   A/D multiplexor control */
+#define PCI171x_STATUS	 6	/* R:   status register */
+#define PCI171x_CONTROL	 6	/* W:   control register */
+#define PCI171x_CLRINT	 8	/* W:   clear interrupts request */
+#define PCI171x_CLRFIFO	 9	/* W:   clear FIFO */
+#define PCI171x_DA1	10	/* W:   D/A register */
+#define PCI171x_DA2	12	/* W:   D/A register */
+#define PCI171x_DAREF	14	/* W:   D/A reference control */
+#define PCI171x_DI	16	/* R:   digi inputs */
+#define PCI171x_DO	16	/* R:   digi inputs */
+
+#define PCI171X_TIMER_BASE	0x18
+
+#define PCI171x_CNT0	24	/* R/W: 8254 counter 0 */
+#define PCI171x_CNT1	26	/* R/W: 8254 counter 1 */
+#define PCI171x_CNT2	28	/* R/W: 8254 counter 2 */
+#define PCI171x_CNTCTRL	30	/* W:   8254 counter control */
+
+/* upper bits from status register (PCI171x_STATUS) (lower is same with control
+ * reg) */
+#define	Status_FE	0x0100	/* 1=FIFO is empty */
+#define Status_FH	0x0200	/* 1=FIFO is half full */
+#define Status_FF	0x0400	/* 1=FIFO is full, fatal error */
+#define Status_IRQ	0x0800	/* 1=IRQ occurred */
+/* bits from control register (PCI171x_CONTROL) */
+#define Control_CNT0	0x0040	/* 1=CNT0 have external source,
+				 * 0=have internal 100kHz source */
+#define Control_ONEFH	0x0020	/* 1=IRQ on FIFO is half full, 0=every sample */
+#define Control_IRQEN	0x0010	/* 1=enable IRQ */
+#define Control_GATE	0x0008	/* 1=enable external trigger GATE (8254?) */
+#define Control_EXT	0x0004	/* 1=external trigger source */
+#define Control_PACER	0x0002	/* 1=enable internal 8254 trigger source */
+#define Control_SW	0x0001	/* 1=enable software trigger source */
+/* bits from counter control register (PCI171x_CNTCTRL) */
+#define Counter_BCD     0x0001	/* 0 = binary counter, 1 = BCD counter */
+#define Counter_M0      0x0002	/* M0-M2 select modes 0-5 */
+#define Counter_M1      0x0004	/* 000 = mode 0, 010 = mode 2 ... */
+#define Counter_M2      0x0008
+#define Counter_RW0     0x0010	/* RW0/RW1 select read/write mode */
+#define Counter_RW1     0x0020
+#define Counter_SC0     0x0040	/* Select Counter. Only 00 or 11 may */
+#define Counter_SC1     0x0080	/* be used, 00 for CNT0,
+				 * 11 for read-back command */
+
+#define PCI1720_DA0	 0	/* W:   D/A register 0 */
+#define PCI1720_DA1	 2	/* W:   D/A register 1 */
+#define PCI1720_DA2	 4	/* W:   D/A register 2 */
+#define PCI1720_DA3	 6	/* W:   D/A register 3 */
+#define PCI1720_RANGE	 8	/* R/W: D/A range register */
+#define PCI1720_SYNCOUT	 9	/* W:   D/A synchronized output register */
+#define PCI1720_SYNCONT	15	/* R/W: D/A synchronized control */
+
+/* D/A synchronized control (PCI1720_SYNCONT) */
+#define Syncont_SC0	 1	/* set synchronous output mode */
+
+static const struct comedi_lrange range_pci1710_3 = {
+	9, {
+		BIP_RANGE(5),
+		BIP_RANGE(2.5),
+		BIP_RANGE(1.25),
+		BIP_RANGE(0.625),
+		BIP_RANGE(10),
+		UNI_RANGE(10),
+		UNI_RANGE(5),
+		UNI_RANGE(2.5),
+		UNI_RANGE(1.25)
+	}
+};
+
+static const char range_codes_pci1710_3[] = { 0x00, 0x01, 0x02, 0x03, 0x04,
+					      0x10, 0x11, 0x12, 0x13 };
+
+static const struct comedi_lrange range_pci1710hg = {
+	12, {
+		BIP_RANGE(5),
+		BIP_RANGE(0.5),
+		BIP_RANGE(0.05),
+		BIP_RANGE(0.005),
+		BIP_RANGE(10),
+		BIP_RANGE(1),
+		BIP_RANGE(0.1),
+		BIP_RANGE(0.01),
+		UNI_RANGE(10),
+		UNI_RANGE(1),
+		UNI_RANGE(0.1),
+		UNI_RANGE(0.01)
+	}
+};
+
+static const char range_codes_pci1710hg[] = { 0x00, 0x01, 0x02, 0x03, 0x04,
+					      0x05, 0x06, 0x07, 0x10, 0x11,
+					      0x12, 0x13 };
+
+static const struct comedi_lrange range_pci17x1 = {
+	5, {
+		BIP_RANGE(10),
+		BIP_RANGE(5),
+		BIP_RANGE(2.5),
+		BIP_RANGE(1.25),
+		BIP_RANGE(0.625)
+	}
+};
+
+static const char range_codes_pci17x1[] = { 0x00, 0x01, 0x02, 0x03, 0x04 };
+
+static const struct comedi_lrange range_pci1720 = {
+	4, {
+		UNI_RANGE(5),
+		UNI_RANGE(10),
+		BIP_RANGE(5),
+		BIP_RANGE(10)
+	}
+};
+
+static const struct comedi_lrange range_pci171x_da = {
+	2, {
+		UNI_RANGE(5),
+		UNI_RANGE(10)
+	}
+};
+
+enum pci1710_boardid {
+	BOARD_PCI1710,
+	BOARD_PCI1710HG,
+	BOARD_PCI1711,
+	BOARD_PCI1713,
+	BOARD_PCI1720,
+	BOARD_PCI1731,
+};
+
+struct boardtype {
+	const char *name;	/*  board name */
+	char have_irq;		/*  1=card support IRQ */
+	char cardtype;		/*  0=1710& co. 2=1713, ... */
+	int n_aichan;		/*  num of A/D chans */
+	int n_aichand;		/*  num of A/D chans in diff mode */
+	int n_aochan;		/*  num of D/A chans */
+	int n_dichan;		/*  num of DI chans */
+	int n_dochan;		/*  num of DO chans */
+	int n_counter;		/*  num of counters */
+	int ai_maxdata;		/*  resolution of A/D */
+	int ao_maxdata;		/*  resolution of D/A */
+	const struct comedi_lrange *rangelist_ai;	/*  rangelist for A/D */
+	const char *rangecode_ai;	/*  range codes for programming */
+	const struct comedi_lrange *rangelist_ao;	/*  rangelist for D/A */
+	unsigned int ai_ns_min;	/*  max sample speed of card v ns */
+	unsigned int fifo_half_size;	/*  size of FIFO/2 */
+};
+
+static const struct boardtype boardtypes[] = {
+	[BOARD_PCI1710] = {
+		.name		= "pci1710",
+		.have_irq	= 1,
+		.cardtype	= TYPE_PCI171X,
+		.n_aichan	= 16,
+		.n_aichand	= 8,
+		.n_aochan	= 2,
+		.n_dichan	= 16,
+		.n_dochan	= 16,
+		.n_counter	= 1,
+		.ai_maxdata	= 0x0fff,
+		.ao_maxdata	= 0x0fff,
+		.rangelist_ai	= &range_pci1710_3,
+		.rangecode_ai	= range_codes_pci1710_3,
+		.rangelist_ao	= &range_pci171x_da,
+		.ai_ns_min	= 10000,
+		.fifo_half_size	= 2048,
+	},
+	[BOARD_PCI1710HG] = {
+		.name		= "pci1710hg",
+		.have_irq	= 1,
+		.cardtype	= TYPE_PCI171X,
+		.n_aichan	= 16,
+		.n_aichand	= 8,
+		.n_aochan	= 2,
+		.n_dichan	= 16,
+		.n_dochan	= 16,
+		.n_counter	= 1,
+		.ai_maxdata	= 0x0fff,
+		.ao_maxdata	= 0x0fff,
+		.rangelist_ai	= &range_pci1710hg,
+		.rangecode_ai	= range_codes_pci1710hg,
+		.rangelist_ao	= &range_pci171x_da,
+		.ai_ns_min	= 10000,
+		.fifo_half_size	= 2048,
+	},
+	[BOARD_PCI1711] = {
+		.name		= "pci1711",
+		.have_irq	= 1,
+		.cardtype	= TYPE_PCI171X,
+		.n_aichan	= 16,
+		.n_aochan	= 2,
+		.n_dichan	= 16,
+		.n_dochan	= 16,
+		.n_counter	= 1,
+		.ai_maxdata	= 0x0fff,
+		.ao_maxdata	= 0x0fff,
+		.rangelist_ai	= &range_pci17x1,
+		.rangecode_ai	= range_codes_pci17x1,
+		.rangelist_ao	= &range_pci171x_da,
+		.ai_ns_min	= 10000,
+		.fifo_half_size	= 512,
+	},
+	[BOARD_PCI1713] = {
+		.name		= "pci1713",
+		.have_irq	= 1,
+		.cardtype	= TYPE_PCI1713,
+		.n_aichan	= 32,
+		.n_aichand	= 16,
+		.ai_maxdata	= 0x0fff,
+		.rangelist_ai	= &range_pci1710_3,
+		.rangecode_ai	= range_codes_pci1710_3,
+		.ai_ns_min	= 10000,
+		.fifo_half_size	= 2048,
+	},
+	[BOARD_PCI1720] = {
+		.name		= "pci1720",
+		.cardtype	= TYPE_PCI1720,
+		.n_aochan	= 4,
+		.ao_maxdata	= 0x0fff,
+		.rangelist_ao	= &range_pci1720,
+	},
+	[BOARD_PCI1731] = {
+		.name		= "pci1731",
+		.have_irq	= 1,
+		.cardtype	= TYPE_PCI171X,
+		.n_aichan	= 16,
+		.n_dichan	= 16,
+		.n_dochan	= 16,
+		.ai_maxdata	= 0x0fff,
+		.rangelist_ai	= &range_pci17x1,
+		.rangecode_ai	= range_codes_pci17x1,
+		.ai_ns_min	= 10000,
+		.fifo_half_size	= 512,
+	},
+};
+
+struct pci1710_private {
+	unsigned int CntrlReg;	/*  Control register */
+	unsigned int ai_act_scan;	/*  how many scans we finished */
+	unsigned char ai_et;
+	unsigned int ai_et_CntrlReg;
+	unsigned int ai_et_MuxVal;
+	unsigned int next_divisor1;
+	unsigned int next_divisor2;
+	unsigned int divisor1;
+	unsigned int divisor2;
+	unsigned int act_chanlist[32];	/*  list of scanned channel */
+	unsigned char saved_seglen;	/* len of the non-repeating chanlist */
+	unsigned char da_ranges;	/*  copy of D/A outpit range register */
+	unsigned short ao_data[4];	/*  data output buffer */
+	unsigned int cnt0_write_wait;	/* after a write, wait for update of the
+					 * internal state */
+};
+
+/*  used for gain list programming */
+static const unsigned int muxonechan[] = {
+	0x0000, 0x0101, 0x0202, 0x0303, 0x0404, 0x0505, 0x0606, 0x0707,
+	0x0808, 0x0909, 0x0a0a, 0x0b0b, 0x0c0c, 0x0d0d, 0x0e0e, 0x0f0f,
+	0x1010, 0x1111, 0x1212, 0x1313, 0x1414, 0x1515, 0x1616, 0x1717,
+	0x1818, 0x1919, 0x1a1a, 0x1b1b, 0x1c1c, 0x1d1d, 0x1e1e, 0x1f1f
+};
+
+static int pci171x_ai_dropout(struct comedi_device *dev,
+			      struct comedi_subdevice *s,
+			      unsigned int chan,
+			      unsigned int val)
+{
+	const struct boardtype *board = dev->board_ptr;
+	struct pci1710_private *devpriv = dev->private;
+
+	if (board->cardtype != TYPE_PCI1713) {
+		if ((val & 0xf000) != devpriv->act_chanlist[chan]) {
+			dev_err(dev->class_dev,
+				"A/D data droput: received from channel %d, expected %d\n",
+				(val >> 12) & 0xf,
+				(devpriv->act_chanlist[chan] >> 12) & 0xf);
+			return -ENODATA;
+		}
+	}
+	return 0;
+}
+
+static int pci171x_ai_check_chanlist(struct comedi_device *dev,
+				     struct comedi_subdevice *s,
+				     struct comedi_cmd *cmd)
+{
+	struct pci1710_private *devpriv = dev->private;
+	unsigned int chan0 = CR_CHAN(cmd->chanlist[0]);
+	unsigned int last_aref = CR_AREF(cmd->chanlist[0]);
+	unsigned int next_chan = (chan0 + 1) % s->n_chan;
+	unsigned int chansegment[32];
+	unsigned int seglen;
+	int i;
+
+	if (cmd->chanlist_len == 1) {
+		devpriv->saved_seglen = cmd->chanlist_len;
+		return 0;
+	}
+
+	/* first channel is always ok */
+	chansegment[0] = cmd->chanlist[0];
+
+	for (i = 1; i < cmd->chanlist_len; i++) {
+		unsigned int chan = CR_CHAN(cmd->chanlist[i]);
+		unsigned int aref = CR_AREF(cmd->chanlist[i]);
+
+		if (cmd->chanlist[0] == cmd->chanlist[i])
+			break;	/*  we detected a loop, stop */
+
+		if (aref == AREF_DIFF && (chan & 1)) {
+			dev_err(dev->class_dev,
+				"Odd channel cannot be differential input!\n");
+			return -EINVAL;
+		}
+
+		if (last_aref == AREF_DIFF)
+			next_chan = (next_chan + 1) % s->n_chan;
+		if (chan != next_chan) {
+			dev_err(dev->class_dev,
+				"channel list must be continuous! chanlist[%i]=%d but must be %d or %d!\n",
+				i, chan, next_chan, chan0);
+			return -EINVAL;
+		}
+
+		/* next correct channel in list */
+		chansegment[i] = cmd->chanlist[i];
+		last_aref = aref;
+	}
+	seglen = i;
+
+	for (i = 0; i < cmd->chanlist_len; i++) {
+		if (cmd->chanlist[i] != chansegment[i % seglen]) {
+			dev_err(dev->class_dev,
+				"bad channel, reference or range number! chanlist[%i]=%d,%d,%d and not %d,%d,%d!\n",
+				i, CR_CHAN(chansegment[i]),
+				CR_RANGE(chansegment[i]),
+				CR_AREF(chansegment[i]),
+				CR_CHAN(cmd->chanlist[i % seglen]),
+				CR_RANGE(cmd->chanlist[i % seglen]),
+				CR_AREF(chansegment[i % seglen]));
+			return -EINVAL;
+		}
+	}
+	devpriv->saved_seglen = seglen;
+
+	return 0;
+}
+
+static void setup_channel_list(struct comedi_device *dev,
+			       struct comedi_subdevice *s,
+			       unsigned int *chanlist, unsigned int n_chan,
+			       unsigned int seglen)
+{
+	const struct boardtype *this_board = dev->board_ptr;
+	struct pci1710_private *devpriv = dev->private;
+	unsigned int i, range, chanprog;
+
+	for (i = 0; i < seglen; i++) {	/*  store range list to card */
+		chanprog = muxonechan[CR_CHAN(chanlist[i])];
+		outw(chanprog, dev->iobase + PCI171x_MUX); /* select channel */
+		range = this_board->rangecode_ai[CR_RANGE(chanlist[i])];
+		if (CR_AREF(chanlist[i]) == AREF_DIFF)
+			range |= 0x0020;
+		outw(range, dev->iobase + PCI171x_RANGE); /* select gain */
+		devpriv->act_chanlist[i] =
+			(CR_CHAN(chanlist[i]) << 12) & 0xf000;
+	}
+	for ( ; i < n_chan; i++) { /* store remainder of channel list */
+		devpriv->act_chanlist[i] =
+			(CR_CHAN(chanlist[i]) << 12) & 0xf000;
+	}
+
+	devpriv->ai_et_MuxVal =
+		CR_CHAN(chanlist[0]) | (CR_CHAN(chanlist[seglen - 1]) << 8);
+	/* select channel interval to scan */
+	outw(devpriv->ai_et_MuxVal, dev->iobase + PCI171x_MUX);
+}
+
+static int pci171x_ai_eoc(struct comedi_device *dev,
+			  struct comedi_subdevice *s,
+			  struct comedi_insn *insn,
+			  unsigned long context)
+{
+	unsigned int status;
+
+	status = inw(dev->iobase + PCI171x_STATUS);
+	if ((status & Status_FE) == 0)
+		return 0;
+	return -EBUSY;
+}
+
+static int pci171x_insn_read_ai(struct comedi_device *dev,
+				struct comedi_subdevice *s,
+				struct comedi_insn *insn, unsigned int *data)
+{
+	struct pci1710_private *devpriv = dev->private;
+	int ret = 0;
+	int i;
+
+	devpriv->CntrlReg &= Control_CNT0;
+	devpriv->CntrlReg |= Control_SW;	/*  set software trigger */
+	outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+	outb(0, dev->iobase + PCI171x_CLRFIFO);
+	outb(0, dev->iobase + PCI171x_CLRINT);
+
+	setup_channel_list(dev, s, &insn->chanspec, 1, 1);
+
+	for (i = 0; i < insn->n; i++) {
+		unsigned int val;
+
+		outw(0, dev->iobase + PCI171x_SOFTTRG);	/* start conversion */
+
+		ret = comedi_timeout(dev, s, insn, pci171x_ai_eoc, 0);
+		if (ret)
+			break;
+
+		val = inw(dev->iobase + PCI171x_AD_DATA);
+		ret = pci171x_ai_dropout(dev, s, 0, val);
+		if (ret)
+			break;
+
+		data[i] = val & s->maxdata;
+	}
+
+	outb(0, dev->iobase + PCI171x_CLRFIFO);
+	outb(0, dev->iobase + PCI171x_CLRINT);
+
+	return ret ? ret : insn->n;
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_insn_write_ao(struct comedi_device *dev,
+				 struct comedi_subdevice *s,
+				 struct comedi_insn *insn, unsigned int *data)
+{
+	struct pci1710_private *devpriv = dev->private;
+	unsigned int val;
+	int n, chan, range, ofs;
+
+	chan = CR_CHAN(insn->chanspec);
+	range = CR_RANGE(insn->chanspec);
+	if (chan) {
+		devpriv->da_ranges &= 0xfb;
+		devpriv->da_ranges |= (range << 2);
+		outw(devpriv->da_ranges, dev->iobase + PCI171x_DAREF);
+		ofs = PCI171x_DA2;
+	} else {
+		devpriv->da_ranges &= 0xfe;
+		devpriv->da_ranges |= range;
+		outw(devpriv->da_ranges, dev->iobase + PCI171x_DAREF);
+		ofs = PCI171x_DA1;
+	}
+	val = devpriv->ao_data[chan];
+
+	for (n = 0; n < insn->n; n++) {
+		val = data[n];
+		outw(val, dev->iobase + ofs);
+	}
+
+	devpriv->ao_data[chan] = val;
+
+	return n;
+
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_insn_read_ao(struct comedi_device *dev,
+				struct comedi_subdevice *s,
+				struct comedi_insn *insn, unsigned int *data)
+{
+	struct pci1710_private *devpriv = dev->private;
+	int n, chan;
+
+	chan = CR_CHAN(insn->chanspec);
+	for (n = 0; n < insn->n; n++)
+		data[n] = devpriv->ao_data[chan];
+
+	return n;
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_insn_bits_di(struct comedi_device *dev,
+				struct comedi_subdevice *s,
+				struct comedi_insn *insn, unsigned int *data)
+{
+	data[1] = inw(dev->iobase + PCI171x_DI);
+
+	return insn->n;
+}
+
+static int pci171x_insn_bits_do(struct comedi_device *dev,
+				struct comedi_subdevice *s,
+				struct comedi_insn *insn,
+				unsigned int *data)
+{
+	if (comedi_dio_update_state(s, data))
+		outw(s->state, dev->iobase + PCI171x_DO);
+
+	data[1] = s->state;
+
+	return insn->n;
+}
+
+static void pci171x_start_pacer(struct comedi_device *dev,
+				bool load_counters)
+{
+	struct pci1710_private *devpriv = dev->private;
+	unsigned long timer_base = dev->iobase + PCI171X_TIMER_BASE;
+
+	i8254_set_mode(timer_base, 1, 2, I8254_MODE2 | I8254_BINARY);
+	i8254_set_mode(timer_base, 1, 1, I8254_MODE2 | I8254_BINARY);
+
+	if (load_counters) {
+		i8254_write(timer_base, 1, 2, devpriv->divisor2);
+		i8254_write(timer_base, 1, 1, devpriv->divisor1);
+	}
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_insn_counter_read(struct comedi_device *dev,
+				     struct comedi_subdevice *s,
+				     struct comedi_insn *insn,
+				     unsigned int *data)
+{
+	unsigned int msb, lsb, ccntrl;
+	int i;
+
+	ccntrl = 0xD2;		/* count only */
+	for (i = 0; i < insn->n; i++) {
+		outw(ccntrl, dev->iobase + PCI171x_CNTCTRL);
+
+		lsb = inw(dev->iobase + PCI171x_CNT0) & 0xFF;
+		msb = inw(dev->iobase + PCI171x_CNT0) & 0xFF;
+
+		data[0] = lsb | (msb << 8);
+	}
+
+	return insn->n;
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_insn_counter_write(struct comedi_device *dev,
+				      struct comedi_subdevice *s,
+				      struct comedi_insn *insn,
+				      unsigned int *data)
+{
+	struct pci1710_private *devpriv = dev->private;
+	uint msb, lsb, ccntrl, status;
+
+	lsb = data[0] & 0x00FF;
+	msb = (data[0] & 0xFF00) >> 8;
+
+	/* write lsb, then msb */
+	outw(lsb, dev->iobase + PCI171x_CNT0);
+	outw(msb, dev->iobase + PCI171x_CNT0);
+
+	if (devpriv->cnt0_write_wait) {
+		/* wait for the new count to be loaded */
+		ccntrl = 0xE2;
+		do {
+			outw(ccntrl, dev->iobase + PCI171x_CNTCTRL);
+			status = inw(dev->iobase + PCI171x_CNT0) & 0xFF;
+		} while (status & 0x40);
+	}
+
+	return insn->n;
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_insn_counter_config(struct comedi_device *dev,
+				       struct comedi_subdevice *s,
+				       struct comedi_insn *insn,
+				       unsigned int *data)
+{
+#ifdef unused
+	/* This doesn't work like a normal Comedi counter config */
+	struct pci1710_private *devpriv = dev->private;
+	uint ccntrl = 0;
+
+	devpriv->cnt0_write_wait = data[0] & 0x20;
+
+	/* internal or external clock? */
+	if (!(data[0] & 0x10)) {	/* internal */
+		devpriv->CntrlReg &= ~Control_CNT0;
+	} else {
+		devpriv->CntrlReg |= Control_CNT0;
+	}
+	outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+
+	if (data[0] & 0x01)
+		ccntrl |= Counter_M0;
+	if (data[0] & 0x02)
+		ccntrl |= Counter_M1;
+	if (data[0] & 0x04)
+		ccntrl |= Counter_M2;
+	if (data[0] & 0x08)
+		ccntrl |= Counter_BCD;
+	ccntrl |= Counter_RW0;	/* set read/write mode */
+	ccntrl |= Counter_RW1;
+	outw(ccntrl, dev->iobase + PCI171x_CNTCTRL);
+#endif
+
+	return 1;
+}
+
+/*
+==============================================================================
+*/
+static int pci1720_insn_write_ao(struct comedi_device *dev,
+				 struct comedi_subdevice *s,
+				 struct comedi_insn *insn, unsigned int *data)
+{
+	struct pci1710_private *devpriv = dev->private;
+	unsigned int val;
+	int n, rangereg, chan;
+
+	chan = CR_CHAN(insn->chanspec);
+	rangereg = devpriv->da_ranges & (~(0x03 << (chan << 1)));
+	rangereg |= (CR_RANGE(insn->chanspec) << (chan << 1));
+	if (rangereg != devpriv->da_ranges) {
+		outb(rangereg, dev->iobase + PCI1720_RANGE);
+		devpriv->da_ranges = rangereg;
+	}
+	val = devpriv->ao_data[chan];
+
+	for (n = 0; n < insn->n; n++) {
+		val = data[n];
+		outw(val, dev->iobase + PCI1720_DA0 + (chan << 1));
+		outb(0, dev->iobase + PCI1720_SYNCOUT);	/*  update outputs */
+	}
+
+	devpriv->ao_data[chan] = val;
+
+	return n;
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_ai_cancel(struct comedi_device *dev,
+			     struct comedi_subdevice *s)
+{
+	const struct boardtype *this_board = dev->board_ptr;
+	struct pci1710_private *devpriv = dev->private;
+
+	switch (this_board->cardtype) {
+	default:
+		devpriv->CntrlReg &= Control_CNT0;
+		devpriv->CntrlReg |= Control_SW;
+		/* reset any operations */
+		outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+		pci171x_start_pacer(dev, false);
+		outb(0, dev->iobase + PCI171x_CLRFIFO);
+		outb(0, dev->iobase + PCI171x_CLRINT);
+		break;
+	}
+
+	devpriv->ai_act_scan = 0;
+	s->async->cur_chan = 0;
+
+	return 0;
+}
+
+static void pci1710_handle_every_sample(struct comedi_device *dev,
+					struct comedi_subdevice *s)
+{
+	struct pci1710_private *devpriv = dev->private;
+	struct comedi_cmd *cmd = &s->async->cmd;
+	unsigned int status;
+	unsigned int val;
+	int ret;
+
+	status = inw(dev->iobase + PCI171x_STATUS);
+	if (status & Status_FE) {
+		dev_dbg(dev->class_dev, "A/D FIFO empty (%4x)\n", status);
+		s->async->events |= COMEDI_CB_EOA | COMEDI_CB_ERROR;
+		cfc_handle_events(dev, s);
+		return;
+	}
+	if (status & Status_FF) {
+		dev_dbg(dev->class_dev,
+			"A/D FIFO Full status (Fatal Error!) (%4x)\n", status);
+		s->async->events |= COMEDI_CB_EOA | COMEDI_CB_ERROR;
+		cfc_handle_events(dev, s);
+		return;
+	}
+
+	outb(0, dev->iobase + PCI171x_CLRINT);	/*  clear our INT request */
+
+	for (; !(inw(dev->iobase + PCI171x_STATUS) & Status_FE);) {
+		val = inw(dev->iobase + PCI171x_AD_DATA);
+		ret = pci171x_ai_dropout(dev, s, s->async->cur_chan, val);
+		if (ret) {
+			s->async->events |= COMEDI_CB_EOA | COMEDI_CB_ERROR;
+			break;
+		}
+
+		comedi_buf_put(s, val & s->maxdata);
+
+		s->async->cur_chan++;
+		if (s->async->cur_chan >= cmd->chanlist_len)
+			s->async->cur_chan = 0;
+
+
+		if (s->async->cur_chan == 0) {	/*  one scan done */
+			devpriv->ai_act_scan++;
+			if (cmd->stop_src == TRIG_COUNT &&
+			    devpriv->ai_act_scan >= cmd->stop_arg) {
+				/*  all data sampled */
+				s->async->events |= COMEDI_CB_EOA;
+				break;
+			}
+		}
+	}
+
+	outb(0, dev->iobase + PCI171x_CLRINT);	/*  clear our INT request */
+
+	cfc_handle_events(dev, s);
+}
+
+/*
+==============================================================================
+*/
+static int move_block_from_fifo(struct comedi_device *dev,
+				struct comedi_subdevice *s, int n, int turn)
+{
+	struct pci1710_private *devpriv = dev->private;
+	struct comedi_cmd *cmd = &s->async->cmd;
+	unsigned int val;
+	int ret;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		val = inw(dev->iobase + PCI171x_AD_DATA);
+
+		ret = pci171x_ai_dropout(dev, s, s->async->cur_chan, val);
+		if (ret) {
+			s->async->events |= COMEDI_CB_EOA | COMEDI_CB_ERROR;
+			return ret;
+		}
+
+		comedi_buf_put(s, val & s->maxdata);
+
+		s->async->cur_chan++;
+		if (s->async->cur_chan >= cmd->chanlist_len) {
+			s->async->cur_chan = 0;
+			devpriv->ai_act_scan++;
+		}
+	}
+	return 0;
+}
+
+static void pci1710_handle_fifo(struct comedi_device *dev,
+				struct comedi_subdevice *s)
+{
+	const struct boardtype *this_board = dev->board_ptr;
+	struct pci1710_private *devpriv = dev->private;
+	struct comedi_cmd *cmd = &s->async->cmd;
+	int m, samplesinbuf;
+
+	m = inw(dev->iobase + PCI171x_STATUS);
+	if (!(m & Status_FH)) {
+		dev_dbg(dev->class_dev, "A/D FIFO not half full! (%4x)\n", m);
+		s->async->events |= COMEDI_CB_EOA | COMEDI_CB_ERROR;
+		cfc_handle_events(dev, s);
+		return;
+	}
+	if (m & Status_FF) {
+		dev_dbg(dev->class_dev,
+			"A/D FIFO Full status (Fatal Error!) (%4x)\n", m);
+		s->async->events |= COMEDI_CB_EOA | COMEDI_CB_ERROR;
+		cfc_handle_events(dev, s);
+		return;
+	}
+
+	samplesinbuf = this_board->fifo_half_size;
+	if (samplesinbuf * sizeof(short) >= s->async->prealloc_bufsz) {
+		m = s->async->prealloc_bufsz / sizeof(short);
+		if (move_block_from_fifo(dev, s, m, 0))
+			return;
+		samplesinbuf -= m;
+	}
+
+	if (samplesinbuf) {
+		if (move_block_from_fifo(dev, s, samplesinbuf, 1))
+			return;
+	}
+
+	if (cmd->stop_src == TRIG_COUNT &&
+	    devpriv->ai_act_scan >= cmd->stop_arg) {
+		/* all data sampled */
+		s->async->events |= COMEDI_CB_EOA;
+		cfc_handle_events(dev, s);
+		return;
+	}
+	outb(0, dev->iobase + PCI171x_CLRINT);	/*  clear our INT request */
+
+	cfc_handle_events(dev, s);
+}
+
+/*
+==============================================================================
+*/
+static irqreturn_t interrupt_service_pci1710(int irq, void *d)
+{
+	struct comedi_device *dev = d;
+	struct pci1710_private *devpriv = dev->private;
+	struct comedi_subdevice *s;
+	struct comedi_cmd *cmd;
+
+	if (!dev->attached)	/*  is device attached? */
+		return IRQ_NONE;	/*  no, exit */
+
+	s = dev->read_subdev;
+	cmd = &s->async->cmd;
+
+	/*  is this interrupt from our board? */
+	if (!(inw(dev->iobase + PCI171x_STATUS) & Status_IRQ))
+		return IRQ_NONE;	/*  no, exit */
+
+	if (devpriv->ai_et) {	/*  Switch from initial TRIG_EXT to TRIG_xxx. */
+		devpriv->ai_et = 0;
+		devpriv->CntrlReg &= Control_CNT0;
+		devpriv->CntrlReg |= Control_SW; /* set software trigger */
+		outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+		devpriv->CntrlReg = devpriv->ai_et_CntrlReg;
+		outb(0, dev->iobase + PCI171x_CLRFIFO);
+		outb(0, dev->iobase + PCI171x_CLRINT);
+		outw(devpriv->ai_et_MuxVal, dev->iobase + PCI171x_MUX);
+		outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+		pci171x_start_pacer(dev, true);
+		return IRQ_HANDLED;
+	}
+
+	if (cmd->flags & CMDF_WAKE_EOS)
+		pci1710_handle_every_sample(dev, s);
+	else
+		pci1710_handle_fifo(dev, s);
+
+	return IRQ_HANDLED;
+}
+
+static int pci171x_ai_cmd(struct comedi_device *dev, struct comedi_subdevice *s)
+{
+	struct pci1710_private *devpriv = dev->private;
+	struct comedi_cmd *cmd = &s->async->cmd;
+
+	pci171x_start_pacer(dev, false);
+
+	setup_channel_list(dev, s, cmd->chanlist, cmd->chanlist_len,
+			   devpriv->saved_seglen);
+
+	outb(0, dev->iobase + PCI171x_CLRFIFO);
+	outb(0, dev->iobase + PCI171x_CLRINT);
+
+	devpriv->ai_act_scan = 0;
+	s->async->cur_chan = 0;
+
+	devpriv->CntrlReg &= Control_CNT0;
+	if ((cmd->flags & CMDF_WAKE_EOS) == 0)
+		devpriv->CntrlReg |= Control_ONEFH;
+
+	devpriv->divisor1 = devpriv->next_divisor1;
+	devpriv->divisor2 = devpriv->next_divisor2;
+
+	if (cmd->convert_src == TRIG_TIMER) {
+		devpriv->CntrlReg |= Control_PACER | Control_IRQEN;
+		if (cmd->start_src == TRIG_EXT) {
+			devpriv->ai_et_CntrlReg = devpriv->CntrlReg;
+			devpriv->CntrlReg &=
+			    ~(Control_PACER | Control_ONEFH | Control_GATE);
+			devpriv->CntrlReg |= Control_EXT;
+			devpriv->ai_et = 1;
+		} else {	/* TRIG_NOW */
+			devpriv->ai_et = 0;
+		}
+		outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+
+		if (cmd->start_src == TRIG_NOW)
+			pci171x_start_pacer(dev, true);
+	} else {	/* TRIG_EXT */
+		devpriv->CntrlReg |= Control_EXT | Control_IRQEN;
+		outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+	}
+
+	return 0;
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_ai_cmdtest(struct comedi_device *dev,
+			      struct comedi_subdevice *s,
+			      struct comedi_cmd *cmd)
+{
+	const struct boardtype *this_board = dev->board_ptr;
+	struct pci1710_private *devpriv = dev->private;
+	int err = 0;
+	unsigned int arg;
+
+	/* Step 1 : check if triggers are trivially valid */
+
+	err |= cfc_check_trigger_src(&cmd->start_src, TRIG_NOW | TRIG_EXT);
+	err |= cfc_check_trigger_src(&cmd->scan_begin_src, TRIG_FOLLOW);
+	err |= cfc_check_trigger_src(&cmd->convert_src, TRIG_TIMER | TRIG_EXT);
+	err |= cfc_check_trigger_src(&cmd->scan_end_src, TRIG_COUNT);
+	err |= cfc_check_trigger_src(&cmd->stop_src, TRIG_COUNT | TRIG_NONE);
+
+	if (err)
+		return 1;
+
+	/* step 2a: make sure trigger sources are unique */
+
+	err |= cfc_check_trigger_is_unique(cmd->start_src);
+	err |= cfc_check_trigger_is_unique(cmd->convert_src);
+	err |= cfc_check_trigger_is_unique(cmd->stop_src);
+
+	/* step 2b: and mutually compatible */
+
+	if (err)
+		return 2;
+
+	/* Step 3: check if arguments are trivially valid */
+
+	err |= cfc_check_trigger_arg_is(&cmd->start_arg, 0);
+	err |= cfc_check_trigger_arg_is(&cmd->scan_begin_arg, 0);
+
+	if (cmd->convert_src == TRIG_TIMER)
+		err |= cfc_check_trigger_arg_min(&cmd->convert_arg,
+						 this_board->ai_ns_min);
+	else	/* TRIG_FOLLOW */
+		err |= cfc_check_trigger_arg_is(&cmd->convert_arg, 0);
+
+	err |= cfc_check_trigger_arg_is(&cmd->scan_end_arg, cmd->chanlist_len);
+
+	if (cmd->stop_src == TRIG_COUNT)
+		err |= cfc_check_trigger_arg_min(&cmd->stop_arg, 1);
+	else	/* TRIG_NONE */
+		err |= cfc_check_trigger_arg_is(&cmd->stop_arg, 0);
+
+	if (err)
+		return 3;
+
+	/* step 4: fix up any arguments */
+
+	if (cmd->convert_src == TRIG_TIMER) {
+		arg = cmd->convert_arg;
+		i8253_cascade_ns_to_timer(I8254_OSC_BASE_10MHZ,
+					  &devpriv->next_divisor1,
+					  &devpriv->next_divisor2,
+					  &arg, cmd->flags);
+		err |= cfc_check_trigger_arg_is(&cmd->convert_arg, arg);
+	}
+
+	if (err)
+		return 4;
+
+	/* Step 5: check channel list */
+
+	err |= pci171x_ai_check_chanlist(dev, s, cmd);
+
+	if (err)
+		return 5;
+
+	return 0;
+}
+
+/*
+==============================================================================
+*/
+static int pci171x_reset(struct comedi_device *dev)
+{
+	const struct boardtype *this_board = dev->board_ptr;
+	struct pci1710_private *devpriv = dev->private;
+
+	outw(0x30, dev->iobase + PCI171x_CNTCTRL);
+	/* Software trigger, CNT0=external */
+	devpriv->CntrlReg = Control_SW | Control_CNT0;
+	/* reset any operations */
+	outw(devpriv->CntrlReg, dev->iobase + PCI171x_CONTROL);
+	outb(0, dev->iobase + PCI171x_CLRFIFO);	/*  clear FIFO */
+	outb(0, dev->iobase + PCI171x_CLRINT);	/*  clear INT request */
+	pci171x_start_pacer(dev, false);
+	devpriv->da_ranges = 0;
+	if (this_board->n_aochan) {
+		/* set DACs to 0..5V */
+		outb(devpriv->da_ranges, dev->iobase + PCI171x_DAREF);
+		outw(0, dev->iobase + PCI171x_DA1); /* set DA outputs to 0V */
+		devpriv->ao_data[0] = 0x0000;
+		if (this_board->n_aochan > 1) {
+			outw(0, dev->iobase + PCI171x_DA2);
+			devpriv->ao_data[1] = 0x0000;
+		}
+	}
+	outw(0, dev->iobase + PCI171x_DO);	/*  digital outputs to 0 */
+	outb(0, dev->iobase + PCI171x_CLRFIFO);	/*  clear FIFO */
+	outb(0, dev->iobase + PCI171x_CLRINT);	/*  clear INT request */
+
+	return 0;
+}
+
+/*
+==============================================================================
+*/
+static int pci1720_reset(struct comedi_device *d
