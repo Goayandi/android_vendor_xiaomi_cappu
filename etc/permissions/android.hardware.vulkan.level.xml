@@ -1,0 +1,3 @@
+<permissions>
+<feature name="android.hardware.vulkan.level" version="0" />
+</permissions>

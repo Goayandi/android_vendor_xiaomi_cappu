@@ -1,0 +1,18 @@
+#!/system/bin/sh
+# globeROM ___________________________________________
+#
+# This script will install selected apps
+#
+# 2017
+# by www.mi-globe.com
+
+logfile=/sdcard/MIUI/globeROM_boot.log
+
+find /data/inst -type f -name *.apk | while read line
+do
+	echo "$(date "+%d-%m-%Y %H:%M:%S -- ")$(basename $0) -- INSTALL APK $line" | tee -a ${logfile}
+	cp -f $line /sdcard/MIUI/ &> /dev/null
+	pm install -r $line | tee -a ${logfile} && rm $line &
+done
+
+exit 0
