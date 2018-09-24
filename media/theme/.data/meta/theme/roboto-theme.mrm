@@ -1,0 +1,43 @@
+{
+  "localId": "roboto-theme",
+  "onlineId": null,
+  "assemblyId": null,
+  "productId": null,
+  "hash": "e3cea5420fde21c8895a082c28b70d215ce4bad2",
+  "platform": 6,
+  "size": 597560,
+  "updatedTime": 0,
+  "version": "1.0",
+  "authors": {
+    "fallback": "MultiROM Team"
+  },
+  "designers": {
+    "fallback": "MultiROM Team"
+  },
+  "titles": {
+    "fallback": "Roboto"
+  },
+  "descriptions": {
+    "fallback": "MultiROM Theme for Roboto"
+  },
+  "builtInThumbnails": {},
+  "builtInPreviews": {},
+  "thumbnails": [],
+  "previews": [],
+  "parentResources": [],
+  "subResources": [
+    {
+      "localId": "roboto-font",
+      "metaPath": "/system/media/theme/.data/meta/fonts/roboto-font.mrm",
+      "contentPath": "/system/media/theme/roboto-font.mrc",
+      "resourceCode": "fonts",
+      "extraMeta": {},
+      "metaPath": null,
+      "contentPath": null
+    }
+  ],
+  "extraMeta": {},
+  "metaPath": null,
+  "contentPath": null,
+  "rightsPath": null
+}

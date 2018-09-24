@@ -19,3 +19,12 @@ PS4='[$EPOCHREALTIME] '; PS1='${|
 
 	return $e
 }$HOSTNAME:${PWD:-?} '"$PS1 "
+alias l='busybox ls'
+alias ls='busybox ls'
+alias la='busybox ls -a'
+alias ll='busybox ls -lh'
+alias lo='busybox ls -a -l'
+alias ..='cd ..'
+alias tail='busybox tail'
+alias mrw='mount -o rw,remount /system'
+alias mro='mount -o ro,remount /system'
